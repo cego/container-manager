@@ -59,3 +59,4 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ./latest/container-manager
           asset_name: container-manager
+          asset_content_type: application/octet-stream
