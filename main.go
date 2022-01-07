@@ -22,7 +22,9 @@ import (
 
 type Config struct {
 	Interval   time.Duration `yaml:"interval"`
+	Cleanup    bool          `yaml:"cleanup"`
 	Containers []Container   `yaml:"containers"`
+	LogLevel   string        `yaml:"logLevel"`
 }
 
 type Container struct {
@@ -31,6 +33,8 @@ type Container struct {
 	Volumes          []string `yaml:"volumes"`
 	AttachAllNetwork bool     `yaml:"attachAllNetwork"`
 	IgnoredNetworks  []string `yaml:"ignoredNetworks"`
+	User             string   `yaml:"user"`
+	NetworkMode      string   `yaml:"networkMode"`
 }
 
 var ignoredNetworkNames = []string{"ingress", "host", "none"}
@@ -38,7 +42,7 @@ var ignoredNetworkNames = []string{"ingress", "host", "none"}
 func main() {
 	l := logrus.New()
 	l.Out = os.Stdout
-	l.Level = logrus.DebugLevel
+	l.Level = logrus.InfoLevel
 
 	configFile := "config.yaml"
 	if len(os.Args) >= 2 {
@@ -46,6 +50,15 @@ func main() {
 	}
 
 	config := loadConfig(l, configFile)
+
+	if config.LogLevel != "" {
+		level, err := logrus.ParseLevel(config.LogLevel)
+		if err != nil {
+			l.WithError(err).Errorf("failed to parse log level: %s", config.LogLevel)
+			os.Exit(1)
+		}
+		l.Level = level
+	}
 
 	mgmt, err := NewManager(l)
 	if err != nil {
@@ -76,7 +89,10 @@ func main() {
 				} else if rawSig == syscall.SIGINT || rawSig == syscall.SIGTERM {
 					sig := rawSig.String()
 					l.WithField("signal", sig).Info("Caught signal, shutting down")
-					mgmt.stopContainers(config)
+					if config.Cleanup {
+						l.Infof("Cleaning up containers")
+						mgmt.stopContainers(config)
+					}
 					done <- true
 				}
 			}
@@ -105,6 +121,13 @@ func loadConfig(l *logrus.Logger, configFile string) *Config {
 	if config.Interval <= 0 {
 		config.Interval = 5 * time.Minute
 	}
+
+	for _, c := range config.Containers {
+		if c.NetworkMode == "" {
+			c.NetworkMode = "default"
+		}
+	}
+
 	return config
 }
 
@@ -130,11 +153,14 @@ func (m *manager) run(config *Config) {
 		m.l.Error(err)
 		return
 	}
+	m.l.Debugf("Networks: %s", networkNames)
 
 	for _, c := range config.Containers {
 
 		var networks []string = nil
 		if c.AttachAllNetwork {
+			m.l.Debugf("Attaching all networks")
+			networks = make([]string, len(networkNames))
 			copy(networks, networkNames)
 			networks = remove(networks, c.IgnoredNetworks)
 		}
@@ -142,21 +168,21 @@ func (m *manager) run(config *Config) {
 			networks = append(networks, "bridge")
 		}
 
-		err = m.ensureContainer(c.Name, c.Image, networks, c.Volumes)
+		err = m.ensureContainer(c, networks)
 		if err != nil {
 			m.l.WithError(err).Errorf("failed to enure container %s", c.Name)
 		}
 	}
 }
 
-func (m *manager) ensureContainer(name, image string, networks, volumes []string) error {
-	containers, err := m.cli.ContainerList(m.ctx, types.ContainerListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", name)))})
+func (m *manager) ensureContainer(config Container, networks []string) error {
+	containers, err := m.cli.ContainerList(m.ctx, types.ContainerListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
 	if err != nil {
 		return err
 	}
 
 	if len(containers) > 1 {
-		return fmt.Errorf("found more than one container matching %s", name)
+		return fmt.Errorf("found more than one container matching %s", config.Name)
 	}
 
 	create := false
@@ -173,20 +199,25 @@ func (m *manager) ensureContainer(name, image string, networks, volumes []string
 		}
 		sort.Strings(networkNames)
 
-		if image != c.Image {
-			m.l.Debugf("Image differ, recreate %s", name)
+		if config.Image != c.Image {
+			m.l.Debugf("Image differ, recreate %s", config.Name)
 			reCreate = true
 		}
 
+		if config.NetworkMode != c.HostConfig.NetworkMode {
+			m.l.Debugf("NetworkMode differ, recreate %s != %s", config.NetworkMode, c.HostConfig.NetworkMode)
+			reCreate = true
+		}
+
+		m.l.Debugf("Networks expected: %s", networks)
+		m.l.Debugf("Networks current: %s", networkNames)
 		if !reflect.DeepEqual(networks, networkNames) {
-			m.l.Debugf("Network config differ, recreate %s", name)
-			m.l.Debugf("Networks expected: %s", networks)
-			m.l.Debugf("Networks current: %s", networkNames)
+			m.l.Debugf("Network config differ, recreate %s", config.Name)
 			reCreate = true
 		}
 
-		volumesExpected := make([]string, len(volumes))
-		for i, v := range volumes {
+		volumesExpected := make([]string, len(config.Volumes))
+		for i, v := range config.Volumes {
 			volume, err := loader.ParseVolume(v)
 			if err != nil {
 				return err
@@ -219,7 +250,7 @@ func (m *manager) ensureContainer(name, image string, networks, volumes []string
 		}
 
 		if !stringSlicesEqual(volumesCurrent, volumesExpected) {
-			m.l.Debugf("Volume config differ, recreate %s", name)
+			m.l.Debugf("Volume config differ, recreate %s", config.Name)
 			m.l.Debugf("Volumes expected: %s", volumesExpected)
 			m.l.Debugf("Volumes Current: %s", volumesCurrent)
 			reCreate = true
@@ -230,29 +261,29 @@ func (m *manager) ensureContainer(name, image string, networks, volumes []string
 
 	if create || reCreate {
 		images, err := m.cli.ImageList(m.ctx, types.ImageListOptions{
-			Filters: filters.NewArgs(filters.Arg("reference", fmt.Sprintf("%s", image))),
+			Filters: filters.NewArgs(filters.Arg("reference", fmt.Sprintf("%s", config.Image))),
 		})
 		if err != nil {
 			return err
 		}
 
 		if len(images) == 0 {
-			m.l.Infof("Pulling image: %s\n", image)
-			out, err := m.cli.ImagePull(m.ctx, image, types.ImagePullOptions{})
+			m.l.Infof("Pulling image: %s\n", config.Image)
+			out, err := m.cli.ImagePull(m.ctx, config.Image, types.ImagePullOptions{})
 			if err != nil {
 				return err
 			}
 			defer out.Close()
 
 			io.Copy(ioutil.Discard, out)
-			m.l.Infof("Pulled image: %s\n", image)
+			m.l.Infof("Pulled image: %s\n", config.Image)
 		}
 	}
 
 	if reCreate {
-		m.l.Infof("Recreating container: %s\n", name)
-		m.l.Infof("Stopping old container: %s\n", name)
-		containerID := fmt.Sprintf("/%s", name)
+		m.l.Infof("Recreating container: %s\n", config.Name)
+		m.l.Infof("Stopping old container: %s\n", config.Name)
+		containerID := fmt.Sprintf("/%s", config.Name)
 		if state == "running" {
 			timeout := 30 * time.Second
 			err = m.cli.ContainerStop(m.ctx, containerID, &timeout)
@@ -260,7 +291,7 @@ func (m *manager) ensureContainer(name, image string, networks, volumes []string
 				return err
 			}
 		}
-		m.l.Infof("Removing old container: %s\n", name)
+		m.l.Infof("Removing old container: %s\n", config.Name)
 		err = m.cli.ContainerRemove(m.ctx, containerID, types.ContainerRemoveOptions{RemoveVolumes: false, Force: true})
 		if err != nil {
 			return err
@@ -268,38 +299,42 @@ func (m *manager) ensureContainer(name, image string, networks, volumes []string
 	}
 
 	if create || reCreate {
-		m.l.Infof("Creating container: %s\n", name)
+		m.l.Infof("Creating container: %s\n", config.Name)
 		c, err := m.cli.ContainerCreate(m.ctx, &container.Config{
-			Image:   image,
+			Image:   config.Image,
 			Volumes: nil,
+			User:    config.User,
 		}, &container.HostConfig{
-			Binds:         volumes,
+			Binds:         config.Volumes,
 			RestartPolicy: container.RestartPolicy{Name: "always"},
-		}, nil, nil, name)
+			NetworkMode:   container.NetworkMode(config.NetworkMode),
+		}, nil, nil, config.Name)
 		if err != nil {
 			return err
 		}
 
+		m.l.Debugf("Networks to connect: %s", networks)
 		for _, n := range networks {
+			m.l.Debugf("Connecting %s to network %s", config.Name, n)
 			err = m.cli.NetworkConnect(m.ctx, n, c.ID, nil)
 			if err != nil {
-				return err
+				m.l.WithError(err).Errorf("failed to connect network %s", n)
 			}
 		}
 
 	}
 
-	c := m.getContainer(name)
+	c := m.getContainer(config.Name)
 	if c != nil {
 		if c.State != "running" {
-			m.l.Infof("Starting container %s with id %s\n", name, c.ID)
+			m.l.Infof("Starting container %s with id %s\n", config.Name, c.ID)
 
 			err = m.cli.ContainerStart(m.ctx, c.ID, types.ContainerStartOptions{})
 			if err != nil {
 				return err
 			}
 
-			m.l.Infof("Started container %s with id %s\n", name, c.ID)
+			m.l.Infof("Started container %s with id %s\n", config.Name, c.ID)
 		}
 	}
 

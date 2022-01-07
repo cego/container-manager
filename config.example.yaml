@@ -1,7 +1,11 @@
 interval: 5m
+cleanup: false
+logLevel: info
 containers:
   - name: <container name>
     image: <repo:tag>
     attachAllNetwork: true # Auto attach container to all available networks
     ignoredNetworks: [] # Networks to not attach
     volumes: []
+    user: root
+    networkMode: default
