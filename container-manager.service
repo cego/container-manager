@@ -1,0 +1,13 @@
+[Unit]
+Description=Container Manager
+Wants=docker.target
+After=docker.target network.target
+
+[Service]
+SyslogIdentifier=container-manager
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/local/bin/container-manager -config /etc/container-manager/config.yaml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
