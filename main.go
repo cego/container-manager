@@ -9,6 +9,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/sirupsen/logrus"
+	"go.elastic.co/ecslogrus"
 	"gopkg.in/yaml.v3"
 	"io"
 	"io/ioutil"
@@ -43,6 +44,7 @@ func main() {
 	l := logrus.New()
 	l.Out = os.Stdout
 	l.Level = logrus.InfoLevel
+	l.SetFormatter(&ecslogrus.Formatter{})
 
 	configFile := "config.yaml"
 	if len(os.Args) >= 2 {
@@ -153,13 +155,13 @@ func (m *manager) run(config *Config) {
 		m.l.Error(err)
 		return
 	}
-	m.l.Debugf("Networks: %s", networkNames)
+	m.l.WithField("networks", networkNames).Debugf("Networks: %s", networkNames)
 
 	for _, c := range config.Containers {
 
 		var networks []string = nil
 		if c.AttachAllNetwork {
-			m.l.Debugf("Attaching all networks")
+			m.l.WithField("name", c.Name).Debugf("Attaching all networks")
 			networks = make([]string, len(networkNames))
 			copy(networks, networkNames)
 			networks = remove(networks, c.IgnoredNetworks)
@@ -170,7 +172,7 @@ func (m *manager) run(config *Config) {
 
 		err = m.ensureContainer(c, networks)
 		if err != nil {
-			m.l.WithError(err).Errorf("failed to enure container %s", c.Name)
+			m.l.WithField("name", c.Name).WithError(err).Errorf("failed to enure container %s", c.Name)
 		}
 	}
 }
@@ -200,19 +202,19 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		sort.Strings(networkNames)
 
 		if config.Image != c.Image {
-			m.l.Debugf("Image differ, recreate %s", config.Name)
+			m.l.WithField("name", config.Name).Debugf("Image differ, recreate %s", config.Name)
 			reCreate = true
 		}
 
 		if config.NetworkMode != c.HostConfig.NetworkMode {
-			m.l.Debugf("NetworkMode differ, recreate %s != %s", config.NetworkMode, c.HostConfig.NetworkMode)
+			m.l.WithField("name", config.Name).Debugf("NetworkMode differ, recreate %s != %s", config.NetworkMode, c.HostConfig.NetworkMode)
 			reCreate = true
 		}
 
-		m.l.Debugf("Networks expected: %s", networks)
-		m.l.Debugf("Networks current: %s", networkNames)
+		m.l.WithField("name", config.Name).Debugf("Networks expected: %s", networks)
+		m.l.WithField("name", config.Name).Debugf("Networks current: %s", networkNames)
 		if !reflect.DeepEqual(networks, networkNames) {
-			m.l.Debugf("Network config differ, recreate %s", config.Name)
+			m.l.WithField("name", config.Name).Debugf("Network config differ, recreate %s", config.Name)
 			reCreate = true
 		}
 
@@ -250,9 +252,9 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		}
 
 		if !stringSlicesEqual(volumesCurrent, volumesExpected) {
-			m.l.Debugf("Volume config differ, recreate %s", config.Name)
-			m.l.Debugf("Volumes expected: %s", volumesExpected)
-			m.l.Debugf("Volumes Current: %s", volumesCurrent)
+			m.l.WithField("name", config.Name).Debugf("Volume config differ, recreate %s", config.Name)
+			m.l.WithField("name", config.Name).Debugf("Volumes expected: %s", volumesExpected)
+			m.l.WithField("name", config.Name).Debugf("Volumes Current: %s", volumesCurrent)
 			reCreate = true
 		}
 
@@ -268,7 +270,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		}
 
 		if len(images) == 0 {
-			m.l.Infof("Pulling image: %s\n", config.Image)
+			m.l.WithField("name", config.Name).Infof("Pulling image: %s\n", config.Image)
 			out, err := m.cli.ImagePull(m.ctx, config.Image, types.ImagePullOptions{})
 			if err != nil {
 				return err
@@ -276,13 +278,17 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			defer out.Close()
 
 			io.Copy(ioutil.Discard, out)
-			m.l.Infof("Pulled image: %s\n", config.Image)
+			m.l.WithField("name", config.Name).Infof("Pulled image: %s\n", config.Image)
 		}
 	}
 
+	if state != "" && state != "running" {
+		m.l.WithField("state", state).WithField("name", config.Name).Infof("Container state before creating new was: %s", state)
+	}
+
 	if reCreate {
-		m.l.Infof("Recreating container: %s\n", config.Name)
-		m.l.Infof("Stopping old container: %s\n", config.Name)
+		m.l.WithField("name", config.Name).Infof("Recreating container: %s\n", config.Name)
+		m.l.WithField("name", config.Name).Infof("Stopping old container: %s\n", config.Name)
 		containerID := fmt.Sprintf("/%s", config.Name)
 		if state == "running" {
 			timeout := 30 * time.Second
@@ -291,7 +297,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 				return err
 			}
 		}
-		m.l.Infof("Removing old container: %s\n", config.Name)
+		m.l.WithField("name", config.Name).Infof("Removing old container: %s\n", config.Name)
 		err = m.cli.ContainerRemove(m.ctx, containerID, types.ContainerRemoveOptions{RemoveVolumes: false, Force: true})
 		if err != nil {
 			return err
@@ -299,7 +305,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 	}
 
 	if create || reCreate {
-		m.l.Infof("Creating container: %s\n", config.Name)
+		m.l.WithField("name", config.Name).Infof("Creating container: %s\n", config.Name)
 		c, err := m.cli.ContainerCreate(m.ctx, &container.Config{
 			Image:   config.Image,
 			Volumes: nil,
@@ -313,12 +319,12 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			return err
 		}
 
-		m.l.Debugf("Networks to connect: %s", networks)
+		m.l.WithField("name", config.Name).Debugf("Networks to connect: %s", networks)
 		for _, n := range networks {
-			m.l.Debugf("Connecting %s to network %s", config.Name, n)
+			m.l.WithField("name", config.Name).Debugf("Connecting %s to network %s", config.Name, n)
 			err = m.cli.NetworkConnect(m.ctx, n, c.ID, nil)
 			if err != nil {
-				m.l.WithError(err).Errorf("failed to connect network %s", n)
+				m.l.WithField("name", config.Name).WithError(err).Errorf("failed to connect network %s", n)
 			}
 		}
 
@@ -327,14 +333,14 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 	c := m.getContainer(config.Name)
 	if c != nil {
 		if c.State != "running" {
-			m.l.Infof("Starting container %s with id %s\n", config.Name, c.ID)
+			m.l.WithField("name", config.Name).Infof("Starting container %s with id %s\n", config.Name, c.ID)
 
 			err = m.cli.ContainerStart(m.ctx, c.ID, types.ContainerStartOptions{})
 			if err != nil {
 				return err
 			}
 
-			m.l.Infof("Started container %s with id %s\n", config.Name, c.ID)
+			m.l.WithField("name", config.Name).Infof("Started container %s with id %s\n", config.Name, c.ID)
 		}
 	}
 
@@ -360,17 +366,17 @@ func (m *manager) stopContainers(config *Config) {
 
 		if c != nil {
 			if c.State == "running" {
-				m.l.Infof("Stopping container: %s", cc.Name)
+				m.l.WithField("name", cc.Name).Infof("Stopping container: %s", cc.Name)
 				timeout := 30 * time.Second
 				err := m.cli.ContainerStop(m.ctx, c.ID, &timeout)
 				if err != nil {
 					m.l.WithError(err).Errorf("error when stopping container")
 				}
 			}
-			m.l.Infof("Removing container: %s", cc.Name)
+			m.l.WithField("name", cc.Name).Infof("Removing container: %s", cc.Name)
 			err := m.cli.ContainerRemove(m.ctx, c.ID, types.ContainerRemoveOptions{RemoveVolumes: false, Force: true})
 			if err != nil {
-				m.l.WithError(err).Errorf("error when removing container")
+				m.l.WithField("name", cc.Name).WithError(err).Errorf("error when removing container")
 			}
 		}
 	}
