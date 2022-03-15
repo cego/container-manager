@@ -29,13 +29,14 @@ type Config struct {
 }
 
 type Container struct {
-	Name             string   `yaml:"name"`
-	Image            string   `yaml:"image"`
-	Volumes          []string `yaml:"volumes"`
-	AttachAllNetwork bool     `yaml:"attachAllNetwork"`
-	IgnoredNetworks  []string `yaml:"ignoredNetworks"`
-	User             string   `yaml:"user"`
-	NetworkMode      string   `yaml:"networkMode"`
+	Name             string            `yaml:"name"`
+	Image            string            `yaml:"image"`
+	Volumes          []string          `yaml:"volumes"`
+	AttachAllNetwork bool              `yaml:"attachAllNetwork"`
+	IgnoredNetworks  []string          `yaml:"ignoredNetworks"`
+	User             string            `yaml:"user"`
+	NetworkMode      string            `yaml:"networkMode"`
+	Labels           map[string]string `yaml:"labels"`
 }
 
 var ignoredNetworkNames = []string{"ingress", "host", "none"}
@@ -258,6 +259,20 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			reCreate = true
 		}
 
+		if config.Labels != nil && len(config.Labels) > 0 {
+			for k, v := range config.Labels {
+				if val, ok := c.Labels[k]; ok {
+					if val != v {
+						reCreate = true
+						break
+					}
+				} else {
+					reCreate = true
+					break
+				}
+			}
+		}
+
 		state = c.State
 	}
 
@@ -310,6 +325,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			Image:   config.Image,
 			Volumes: nil,
 			User:    config.User,
+			Labels:  config.Labels,
 		}, &container.HostConfig{
 			Binds:         config.Volumes,
 			RestartPolicy: container.RestartPolicy{Name: "always"},
