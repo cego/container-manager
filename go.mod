@@ -3,14 +3,15 @@ module container-manager
 go 1.17
 
 require (
-	github.com/docker/cli v20.10.12+incompatible
+	github.com/docker/cli v25.0.3+incompatible
 	github.com/docker/docker v20.10.12+incompatible
 	github.com/sirupsen/logrus v1.8.1
 	go.elastic.co/ecslogrus v1.0.0
-	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
+	dario.cat/mergo v1.0.0 // indirect
 	github.com/Microsoft/go-winio v0.4.17 // indirect
 	github.com/containerd/containerd v1.5.8 // indirect
 	github.com/docker/distribution v2.7.1+incompatible // indirect
