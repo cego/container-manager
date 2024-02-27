@@ -7,7 +7,7 @@ require (
 	github.com/docker/docker v20.10.12+incompatible
 	github.com/sirupsen/logrus v1.8.1
 	go.elastic.co/ecslogrus v1.0.0
-	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
