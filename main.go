@@ -2,23 +2,48 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/docker/cli/cli/compose/loader"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
-	"github.com/sirupsen/logrus"
-	"go.elastic.co/ecslogrus"
-	"gopkg.in/yaml.v3"
 	"io"
-	"io/ioutil"
+	"log"
 	"os"
 	"os/signal"
 	"reflect"
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/docker/cli/cli/compose/loader"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"go.elastic.co/ecslogrus"
+	"gopkg.in/yaml.v3"
+)
+
+// Build A version string that can be set with
+//
+//	-ldflags "-X main.Build=SOMEVERSION"
+//
+// at compile-time.
+var Build string
+
+const (
+	appName = "container-manager"
+)
+
+var (
+	configFile string
+
+	rootCmd = &cobra.Command{
+		Use:     appName,
+		Short:   "A service to start and monitor containers and attach to networks.\n\nService is started by running container-manager config.yaml",
+		Run:     root,
+		Version: Build,
+	}
 )
 
 type Config struct {
@@ -41,15 +66,29 @@ type Container struct {
 
 var ignoredNetworkNames = []string{"ingress", "host", "none"}
 
+func init() {
+	// Cobra parameters
+	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "i", "", "Configuration YAML file")
+}
+
 func main() {
+	err := rootCmd.Execute()
+	if err != nil {
+		log.Fatalf("Error: %s", err.Error())
+	}
+}
+
+func root(_ *cobra.Command, _ []string) {
 	l := logrus.New()
 	l.Out = os.Stdout
 	l.Level = logrus.InfoLevel
 	l.SetFormatter(&ecslogrus.Formatter{})
 
-	configFile := "config.yaml"
-	if len(os.Args) >= 2 {
-		configFile = os.Args[1]
+	_, err := os.Stat(configFile)
+	if errors.Is(err, os.ErrNotExist) {
+		// handle the case where the file doesn't exist
+		l.Errorf("File does not exists: %s", configFile)
+		os.Exit(1)
 	}
 
 	config := loadConfig(l, configFile)
@@ -69,7 +108,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	sigChan := make(chan os.Signal)
+	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP)
 	signal.Notify(sigChan, syscall.SIGTERM)
 	signal.Notify(sigChan, syscall.SIGINT)
@@ -82,7 +121,7 @@ func main() {
 			select {
 			case <-done:
 				return
-			case _ = <-ticker.C:
+			case <-ticker.C:
 				mgmt.run(config)
 			case rawSig := <-sigChan:
 				if rawSig == syscall.SIGHUP {
@@ -108,7 +147,7 @@ func main() {
 }
 
 func loadConfig(l *logrus.Logger, configFile string) *Config {
-	yfile, err := ioutil.ReadFile(configFile)
+	yfile, err := os.ReadFile(configFile)
 	if err != nil {
 		l.Errorf("Failed to read config file: %s", configFile)
 		os.Exit(1)
@@ -278,7 +317,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 
 	if create || reCreate {
 		images, err := m.cli.ImageList(m.ctx, types.ImageListOptions{
-			Filters: filters.NewArgs(filters.Arg("reference", fmt.Sprintf("%s", config.Image))),
+			Filters: filters.NewArgs(filters.Arg("reference", config.Image)),
 		})
 		if err != nil {
 			return err
@@ -292,7 +331,12 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			}
 			defer out.Close()
 
-			io.Copy(ioutil.Discard, out)
+			_, err = io.Copy(io.Discard, out)
+
+			if err != nil {
+				m.l.Errorf("Error discaring response: %s", err.Error())
+			}
+
 			m.l.WithField("name", config.Name).Infof("Pulled image: %s\n", config.Image)
 		}
 	}
