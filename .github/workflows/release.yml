@@ -1,62 +1,41 @@
-on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]*'
+name: Release
 
-name: Create release and upload binaries
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Build
+
     runs-on: ubuntu-latest
     steps:
-      - name: Set up Go 1.17
-        uses: actions/setup-go@v5
-        with:
-          go-version: 1.17
+      - uses: actions/checkout@v4
 
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.21"
+
+      - name: Install dependencies
+        run: go get .
 
       - name: Build
-        run: |
-          mkdir release
-          CGO_ENABLED=0 go build -ldflags "-X main.Build=${{ github.ref_name }}" -o release/container-manager
+        run: CGO_ENABLED=0 go build -ldflags "-X main.Build=${{ github.ref_name }}"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: latest
-          path: release
+      - name: Checksum
+        run: sha256sum container-manager > SHASUM256.txt
 
-  release:
-    name: Create and Upload Release
-    needs: [ build ]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: latest
-          path: latest
+      # - name: Test
+      #   run: go test -v ./...
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
-      - name: Upload linux-amd64
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./latest/container-manager
-          asset_name: container-manager
-          asset_content_type: application/octet-stream
+          files: |
+            container-manager
+            SHASUM256.txt
+          fail_on_unmatched_files: true
