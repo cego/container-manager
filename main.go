@@ -2,23 +2,48 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/docker/cli/cli/compose/loader"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
-	"github.com/sirupsen/logrus"
-	"go.elastic.co/ecslogrus"
-	"gopkg.in/yaml.v3"
 	"io"
-	"io/ioutil"
+	"log"
 	"os"
 	"os/signal"
 	"reflect"
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/docker/cli/cli/compose/loader"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"go.elastic.co/ecslogrus"
+	"gopkg.in/yaml.v3"
+)
+
+// Build A version string that can be set with
+//
+//	-ldflags "-X main.Build=SOMEVERSION"
+//
+// at compile-time.
+var Build string
+
+const (
+	appName = "container-manager"
+)
+
+var (
+	configFile string
+
+	rootCmd = &cobra.Command{
+		Use:     appName,
+		Short:   "A service to start and monitor containers and attach to networks.\n\nService is started by running container-manager config.yaml",
+		Run:     root,
+		Version: Build,
+	}
 )
 
 type Config struct {
@@ -41,15 +66,29 @@ type Container struct {
 
 var ignoredNetworkNames = []string{"ingress", "host", "none"}
 
+func init() {
+	// Cobra parameters
+	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "i", "config.yaml", "Configuration YAML file")
+}
+
 func main() {
+	err := rootCmd.Execute()
+	if err != nil {
+		log.Fatalf("Error: %s", err.Error())
+	}
+}
+
+func root(_ *cobra.Command, _ []string) {
 	l := logrus.New()
 	l.Out = os.Stdout
 	l.Level = logrus.InfoLevel
 	l.SetFormatter(&ecslogrus.Formatter{})
 
-	configFile := "config.yaml"
-	if len(os.Args) >= 2 {
-		configFile = os.Args[1]
+	_, err := os.Stat(configFile)
+	if errors.Is(err, os.ErrNotExist) {
+		// handle the case where the file doesn't exist
+		l.Errorf("File does not exists: %s", configFile)
+		os.Exit(1)
 	}
 
 	config := loadConfig(l, configFile)
@@ -69,7 +108,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	sigChan := make(chan os.Signal)
+	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP)
 	signal.Notify(sigChan, syscall.SIGTERM)
 	signal.Notify(sigChan, syscall.SIGINT)
@@ -82,7 +121,7 @@ func main() {
 			select {
 			case <-done:
 				return
-			case _ = <-ticker.C:
+			case <-ticker.C:
 				mgmt.run(config)
 			case rawSig := <-sigChan:
 				if rawSig == syscall.SIGHUP {
@@ -108,7 +147,7 @@ func main() {
 }
 
 func loadConfig(l *logrus.Logger, configFile string) *Config {
-	yfile, err := ioutil.ReadFile(configFile)
+	yfile, err := os.ReadFile(configFile)
 	if err != nil {
 		l.Errorf("Failed to read config file: %s", configFile)
 		os.Exit(1)
@@ -179,7 +218,7 @@ func (m *manager) run(config *Config) {
 }
 
 func (m *manager) ensureContainer(config Container, networks []string) error {
-	containers, err := m.cli.ContainerList(m.ctx, types.ContainerListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
+	containers, err := m.cli.ContainerList(m.ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
 	if err != nil {
 		return err
 	}
@@ -278,7 +317,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 
 	if create || reCreate {
 		images, err := m.cli.ImageList(m.ctx, types.ImageListOptions{
-			Filters: filters.NewArgs(filters.Arg("reference", fmt.Sprintf("%s", config.Image))),
+			Filters: filters.NewArgs(filters.Arg("reference", config.Image)),
 		})
 		if err != nil {
 			return err
@@ -292,7 +331,12 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			}
 			defer out.Close()
 
-			io.Copy(ioutil.Discard, out)
+			_, err = io.Copy(io.Discard, out)
+
+			if err != nil {
+				m.l.Errorf("Error discaring response: %s", err.Error())
+			}
+
 			m.l.WithField("name", config.Name).Infof("Pulled image: %s\n", config.Image)
 		}
 	}
@@ -306,14 +350,14 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		m.l.WithField("name", config.Name).Infof("Stopping old container: %s\n", config.Name)
 		containerID := fmt.Sprintf("/%s", config.Name)
 		if state == "running" {
-			timeout := 30 * time.Second
-			err = m.cli.ContainerStop(m.ctx, containerID, &timeout)
+			timeout := int(30 * time.Second)
+			err = m.cli.ContainerStop(m.ctx, containerID, container.StopOptions{Timeout: &timeout})
 			if err != nil {
 				return err
 			}
 		}
 		m.l.WithField("name", config.Name).Infof("Removing old container: %s\n", config.Name)
-		err = m.cli.ContainerRemove(m.ctx, containerID, types.ContainerRemoveOptions{RemoveVolumes: false, Force: true})
+		err = m.cli.ContainerRemove(m.ctx, containerID, container.RemoveOptions{RemoveVolumes: false, Force: true})
 		if err != nil {
 			return err
 		}
@@ -351,7 +395,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		if c.State != "running" {
 			m.l.WithField("name", config.Name).Infof("Starting container %s with id %s\n", config.Name, c.ID)
 
-			err = m.cli.ContainerStart(m.ctx, c.ID, types.ContainerStartOptions{})
+			err = m.cli.ContainerStart(m.ctx, c.ID, container.StartOptions{})
 			if err != nil {
 				return err
 			}
@@ -364,7 +408,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 }
 
 func (m *manager) getContainer(name string) *types.Container {
-	containers, err := m.cli.ContainerList(m.ctx, types.ContainerListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", name)))})
+	containers, err := m.cli.ContainerList(m.ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", name)))})
 	if err != nil {
 		return nil
 	}
@@ -383,14 +427,14 @@ func (m *manager) stopContainers(config *Config) {
 		if c != nil {
 			if c.State == "running" {
 				m.l.WithField("name", cc.Name).Infof("Stopping container: %s", cc.Name)
-				timeout := 30 * time.Second
-				err := m.cli.ContainerStop(m.ctx, c.ID, &timeout)
+				timeout := int(30 * time.Second)
+				err := m.cli.ContainerStop(m.ctx, c.ID, container.StopOptions{Timeout: &timeout})
 				if err != nil {
 					m.l.WithError(err).Errorf("error when stopping container")
 				}
 			}
 			m.l.WithField("name", cc.Name).Infof("Removing container: %s", cc.Name)
-			err := m.cli.ContainerRemove(m.ctx, c.ID, types.ContainerRemoveOptions{RemoveVolumes: false, Force: true})
+			err := m.cli.ContainerRemove(m.ctx, c.ID, container.RemoveOptions{RemoveVolumes: false, Force: true})
 			if err != nil {
 				m.l.WithField("name", cc.Name).WithError(err).Errorf("error when removing container")
 			}
