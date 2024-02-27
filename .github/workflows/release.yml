@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: |
           mkdir release
-          CGO_ENABLED=0 go build -o release/container-manager
+          CGO_ENABLED=0 go build -ldflags "-X main.Build=${{ github.ref_name }}" -o release/container-manager
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
