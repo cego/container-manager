@@ -68,7 +68,7 @@ var ignoredNetworkNames = []string{"ingress", "host", "none"}
 
 func init() {
 	// Cobra parameters
-	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "i", "", "Configuration YAML file")
+	rootCmd.PersistentFlags().StringVarP(&configFile, "config", "i", "config.yaml", "Configuration YAML file")
 }
 
 func main() {
