@@ -1,9 +1,9 @@
-name: Go format
+name: Go Lint
 on: [push]
 
 jobs:
-  gofmt:
-    name: format
+  golangci:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -11,6 +11,5 @@ jobs:
         with:
           go-version: '1.21'
           cache: false
-      - name: gofmt
-        run: |
-          gofmt -s -w ./
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
