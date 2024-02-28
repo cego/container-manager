@@ -28,9 +28,6 @@ jobs:
       - name: Checksum
         run: sha256sum container-manager > SHASUM256.txt
 
-      # - name: Test
-      #   run: go test -v ./...
-
       - name: Release
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
