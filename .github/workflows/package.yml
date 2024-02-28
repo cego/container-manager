@@ -18,6 +18,3 @@ jobs:
         run: go get .
       - name: Build
         run: go build -ldflags "-X main.Build=${{ github.ref_name }}" -v ./...
-
-      # - name: Test
-      #   run: go test -v ./...
