@@ -32,7 +32,7 @@ import (
 var Build string
 
 const (
-	appName = "container-manager"
+	appName string = "container-manager"
 )
 
 var (
@@ -190,7 +190,13 @@ func NewManager(l *logrus.Logger) (*manager, error) {
 }
 
 func (m *manager) run(config *Config) {
-	networkNames, err := m.getNetworkNames()
+	// Create a list of container-manager containers
+	configNames := []string{}
+	for _, c := range config.Containers {
+		configNames = append(configNames, c.Name)
+	}
+
+	networkNames, err := m.getNetworkNames(configNames)
 	if err != nil {
 		m.l.Error(err)
 		return
@@ -442,7 +448,7 @@ func (m *manager) stopContainers(config *Config) {
 	}
 }
 
-func (m *manager) getNetworkNames() ([]string, error) {
+func (m *manager) getNetworkNames(configNames []string) ([]string, error) {
 	names := []string{}
 
 	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
@@ -450,9 +456,38 @@ func (m *manager) getNetworkNames() ([]string, error) {
 		return nil, err
 	}
 
+	// fmt.Println(len(configNames))
+
 	for _, network := range networks {
-		if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
-			names = append(names, network.Name)
+		// Inspect each network to get attached containers
+		attached, err := m.cli.NetworkInspect(m.ctx, network.Name, types.NetworkInspectOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		// fmt.Printf("DEBUG: LIST ALL NETWORK CONTAINERS --> ")
+		// fmt.Printf(network.Name)
+		// fmt.Printf(": ")
+
+		for _, container := range attached.Containers {
+			if containsString(configNames, container.Name) && network.Name != "bridge" {
+				// fmt.Println(attached.Containers)
+				// fmt.Print((len(attached.Containers) - len(configNames)))
+				if (len(attached.Containers) - len(configNames)) == 0 {
+					fmt.Printf("Okay, so %s is attached as the only container in %s...\n", container.Name, network.Name)
+				}
+			}
+
+			// fmt.Println(containsString(configNames, container.Name))
+			// fmt.Printf(container.Name)
+		}
+		// fmt.Println("...")
+
+		// If more than 0 containers in a network, then add YAML containers to the network
+		if len(attached.Containers) > 0 {
+			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
+				names = append(names, network.Name)
+			}
 		}
 	}
 
