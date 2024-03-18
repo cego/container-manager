@@ -465,9 +465,8 @@ func (m *manager) getNetworkNames(configNames []string) ([]string, error) {
 
 		for _, container := range attached.Containers {
 			if containsString(configNames, container.Name) && network.Name != "bridge" {
+				// Detach from network if config containers is the only ones
 				if (len(attached.Containers) - len(configNames)) == 0 {
-					fmt.Printf("Okay, so %s is attached as the only container in %s...\n", container.Name, network.Name)
-					// Call detach network
 					m.detachNetwork(network.Name, container.Name)
 				}
 			}
@@ -479,43 +478,52 @@ func (m *manager) getNetworkNames(configNames []string) ([]string, error) {
 			return nil, err
 		}
 
-		fmt.Printf("Num in %s: %v \n", network.Name, len(attached.Containers))
-
-		// If more than 0 containers in a network, then add YAML containers to the network
-		// if (len(attached.Containers) + len(configNames)) > len(configNames) {
+		// If more than 0 containers in a network, then add config containers to the network
 		if len(attached.Containers) > 0 {
 			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
 				names = append(names, network.Name)
+
+				// Attach to network if not already attached
+				for _, container := range configNames {
+					if !containerInNetworks(container, attached) {
+						m.attachNetwork(network.Name, container)
+					}
+				}
 			}
 		}
 	}
 
 	sort.Strings(names)
 
-	fmt.Printf("Network list: %s", names)
-
 	return names, nil
+}
+
+func containerInNetworks(containerName string, attached types.NetworkResource) bool {
+	for _, c := range attached.Containers {
+		if containerName == c.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *manager) detachNetwork(network string, container string) {
 	err := m.cli.NetworkDisconnect(m.ctx, network, container, true)
 
-	m.l.Infof("Detaching %s from network %s\n", container, network)
+	m.l.Debugf("Detaching %s from network %s\n", container, network)
 
 	if err != nil {
 		m.l.Error(err)
 	}
 }
 
-// func (m *manager) attachNetwork(network string, container string) {
-// 	err := m.cli.NetworkConnect(m.ctx, network, container, )
-
-// 	m.l.Infof("Detaching %s from network %s\n", container, network)
-
-// 	if err != nil {
-// 		m.l.Error(err)
-// 	}
-// }
+func (m *manager) attachNetwork(network string, container string) {
+	err := m.cli.NetworkConnect(m.ctx, network, container, nil)
+	if err != nil {
+		m.l.Error(err)
+	}
+	m.l.Debugf("Attaching %s to network %s\n", container, network)
+}
 
 func containsString(strings []string, s string) bool {
 	for _, a := range strings {
