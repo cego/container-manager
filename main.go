@@ -191,12 +191,12 @@ func NewManager(l *logrus.Logger) (*manager, error) {
 
 func (m *manager) run(config *Config) {
 	// Create a list of container-manager containers
-	configNames := []string{}
+	containerNames := []string{}
 	for _, c := range config.Containers {
-		configNames = append(configNames, c.Name)
+		containerNames = append(containerNames, c.Name)
 	}
 
-	networkNames, err := m.getNetworkNames(configNames)
+	networkNames, err := m.getNetworkNames(containerNames)
 	if err != nil {
 		m.l.Error(err)
 		return
