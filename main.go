@@ -484,7 +484,7 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 				names = append(names, network.Name)
 
 				// Attach to network if not already attached
-				for _, container := range configNames {
+				for _, container := range containerNames {
 					if !containerInNetworks(container, attached) {
 						m.attachNetwork(network.Name, container)
 					}
