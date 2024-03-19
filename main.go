@@ -448,7 +448,7 @@ func (m *manager) stopContainers(config *Config) {
 	}
 }
 
-func (m *manager) getNetworkNames(configNames []string) ([]string, error) {
+func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 	names := []string{}
 
 	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
