@@ -478,7 +478,7 @@ func (m *manager) getNetworkNames(configNames []string) ([]string, error) {
 			return nil, err
 		}
 
-		// If more than 0 containers in a network, then add config containers to the network
+		// If more than 0 containers in a network excluding containers from config, then add containers in config to the network
 		if len(attached.Containers) > 0 {
 			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
 				names = append(names, network.Name)
