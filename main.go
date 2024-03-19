@@ -464,9 +464,9 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 		}
 
 		for _, container := range attached.Containers {
-			if containsString(configNames, container.Name) && network.Name != "bridge" {
+			if containsString(containerNames, container.Name) && network.Name != "bridge" {
 				// Detach from network if config containers is the only ones
-				if (len(attached.Containers) - len(configNames)) == 0 {
+				if (len(attached.Containers) - len(containerNames)) == 0 {
 					m.detachNetwork(network.Name, container.Name)
 				}
 			}
