@@ -193,10 +193,16 @@ func (m *manager) run(config *Config) {
 	// Create a list of container-manager containers
 	containerNames := []string{}
 	for _, c := range config.Containers {
-		containerNames = append(containerNames, c.Name)
+		if c.AttachAllNetwork {
+			containerNames = append(containerNames, c.Name)
+		}
 	}
 
-	networkNames, err := m.getNetworkNames(containerNames)
+	// Attach / Detach networks
+	m.ensureNetwork(containerNames)
+
+	// Returns a list of networks with more than 0 containers
+	networkNames, err := m.getNetworkNames()
 	if err != nil {
 		m.l.Error(err)
 		return
@@ -448,7 +454,7 @@ func (m *manager) stopContainers(config *Config) {
 	}
 }
 
-func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
+func (m *manager) getNetworkNames() ([]string, error) {
 	names := []string{}
 
 	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
@@ -463,6 +469,32 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 			return nil, err
 		}
 
+		// If more than 0 containers in a network excluding containers from config, then add containers in config to the network
+		if len(attached.Containers) > 0 {
+			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
+				names = append(names, network.Name)
+			}
+		}
+	}
+
+	sort.Strings(names)
+
+	return names, nil
+}
+
+func (m *manager) ensureNetwork(containerNames []string) {
+	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
+	if err != nil {
+		m.l.Error(err)
+	}
+
+	for _, network := range networks {
+		// Inspect each network to get attached containers
+		attached, err := m.cli.NetworkInspect(m.ctx, network.Name, types.NetworkInspectOptions{})
+		if err != nil {
+			m.l.Error(err)
+		}
+
 		for _, container := range attached.Containers {
 			if containsString(containerNames, container.Name) && network.Name != "bridge" {
 				// Detach from network if config containers is the only ones
@@ -472,17 +504,15 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 			}
 		}
 
-		// Inspect once more to get updated attached containers
+		// Inspect once more to get an updated attached containers
 		attached, err = m.cli.NetworkInspect(m.ctx, network.Name, types.NetworkInspectOptions{})
 		if err != nil {
-			return nil, err
+			m.l.Error(err)
 		}
 
 		// If more than 0 containers in a network excluding containers from config, then add containers in config to the network
 		if len(attached.Containers) > 0 {
 			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
-				names = append(names, network.Name)
-
 				// Attach to network if not already attached
 				for _, container := range containerNames {
 					if !containerInNetworks(container, attached) {
@@ -492,10 +522,6 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 			}
 		}
 	}
-
-	sort.Strings(names)
-
-	return names, nil
 }
 
 func containerInNetworks(containerName string, attached types.NetworkResource) bool {
