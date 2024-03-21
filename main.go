@@ -199,7 +199,7 @@ func (m *manager) run(config *Config) {
 	}
 
 	// Attach / Detach networks
-	m.ensureNetwork(containerNames)
+	m.updateContainerNetworks(containerNames)
 
 	// Returns a list of networks with more than 0 containers
 	networkNames, err := m.getNetworkNames()
@@ -482,7 +482,7 @@ func (m *manager) getNetworkNames() ([]string, error) {
 	return names, nil
 }
 
-func (m *manager) ensureNetwork(containerNames []string) {
+func (m *manager) updateContainerNetworks(containerNames []string) {
 	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
 	if err != nil {
 		m.l.Error(err)
