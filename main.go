@@ -487,20 +487,12 @@ func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		// Count currently attached containerNames
-		attachedContainerNames := 0
-
-		for _, container := range containerNames {
-			if containerInNetworks(container, attached) {
-				attachedContainerNames = attachedContainerNames + 1
-			}
-		}
-
-		// If more than 0 containers in a network (excluding containers from config)
-		if (len(attached.Containers) - attachedContainerNames) > 0 {
-			if (network.Attachable || network.Scope == "local") && !containsString(ignoredNetworkNames, network.Name) {
+		for _, endpoint := range attached.Containers {
+			if !containsString(containerNames, endpoint.Name) &&
+				(network.Attachable || network.Scope == "local") &&
+				!containsString(ignoredNetworkNames, network.Name) {
 				names = append(names, network.Name)
+				break
 			}
 		}
 	}
