@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/docker/cli v25.0.3+incompatible
-	github.com/docker/docker v25.0.3+incompatible
+	github.com/docker/docker v25.0.12+incompatible
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.8.0
 	go.elastic.co/ecslogrus v1.0.0
