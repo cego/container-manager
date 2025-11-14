@@ -124,11 +124,12 @@ func root(_ *cobra.Command, _ []string) {
 			case <-ticker.C:
 				mgmt.run(config)
 			case rawSig := <-sigChan:
-				if rawSig == syscall.SIGHUP {
+				switch rawSig {
+				case syscall.SIGHUP:
 					l.Infof("Reloading")
 					config = loadConfig(l, configFile)
 					mgmt.run(config)
-				} else if rawSig == syscall.SIGINT || rawSig == syscall.SIGTERM {
+				case syscall.SIGINT, syscall.SIGTERM:
 					sig := rawSig.String()
 					l.WithField("signal", sig).Info("Caught signal, shutting down")
 					if config.Cleanup {
@@ -329,7 +330,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			reCreate = true
 		}
 
-		if config.Labels != nil && len(config.Labels) > 0 {
+		if len(config.Labels) > 0 {
 			for k, v := range config.Labels {
 				if val, ok := c.Labels[k]; ok {
 					if val != v {
@@ -360,7 +361,13 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			if err != nil {
 				return err
 			}
-			defer out.Close()
+
+			defer func() {
+				err := out.Close()
+				if err != nil {
+					m.l.Errorf("Error defer out response: %s", err.Error())
+				}
+			}()
 
 			_, err = io.Copy(io.Discard, out)
 
