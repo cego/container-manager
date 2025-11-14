@@ -365,7 +365,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			defer func() {
 				err := out.Close()
 				if err != nil {
-					m.l.Errorf("Error defer out response: %s", err.Error())
+					m.l.Errorf("Error defer out.close() response: %s", err.Error())
 				}
 			}()
 
