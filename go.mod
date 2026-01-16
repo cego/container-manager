@@ -3,7 +3,7 @@ module container-manager
 go 1.24.0
 
 require (
-	github.com/docker/cli v29.0.0+incompatible
+	github.com/docker/cli v29.1.5+incompatible
 	github.com/docker/docker v25.0.14+incompatible
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.10.2
@@ -48,6 +48,7 @@ require (
 	go.opentelemetry.io/otel v1.35.0 // indirect
 	go.opentelemetry.io/otel/metric v1.35.0 // indirect
 	go.opentelemetry.io/otel/trace v1.35.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/mod v0.15.0 // indirect
 	golang.org/x/net v0.28.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
