@@ -1,5 +1,7 @@
 name: Go Lint
 on: [push]
+permissions:
+  contents: read
 
 jobs:
   golangci:
