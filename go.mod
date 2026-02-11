@@ -1,10 +1,11 @@
 module container-manager
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/docker/cli v29.2.1+incompatible
 	github.com/docker/docker v25.0.14+incompatible
+	github.com/samber/lo v1.52.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.10.2
 	go.elastic.co/ecslogrus v1.0.0
@@ -48,6 +49,7 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
+	golang.org/x/text v0.27.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240814211410-ddb44dafa142 // indirect
 	google.golang.org/protobuf v1.35.2 // indirect
