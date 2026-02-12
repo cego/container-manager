@@ -313,9 +313,10 @@ func (m *manager) ensureContainer(config Container, networks []string, container
 			reCreate = true
 		}
 
-		if lo.SomeBy(lo.Entries(config.Labels), func(e lo.Entry[string, string]) bool {
+		labelsChanged := lo.SomeBy(lo.Entries(config.Labels), func(e lo.Entry[string, string]) bool {
 			return c.Labels[e.Key] != e.Value
-		}) {
+		})
+		if labelsChanged {
 			reCreate = true
 		}
 
