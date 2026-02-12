@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -198,12 +199,18 @@ func (m *manager) run(config *Config) {
 	})
 
 	// Build sorted index for deterministic IP assignment from the upper range.
-	// Each container gets a unique offset so containers on the same node never race for the same IP.
+	// nodeOffset ensures each swarm node picks a different IP block.
+	nodeOffset := 0
+	if info, err := m.cli.Info(m.ctx); err == nil && info.Swarm.NodeID != "" {
+		h := fnv.New32a()
+		h.Write([]byte(info.Swarm.NodeID))
+		nodeOffset = int(h.Sum32()%128) * len(config.Containers)
+	}
 	sortedNames := lo.Map(config.Containers, func(c Container, _ int) string { return c.Name })
 	slices.Sort(sortedNames)
 	containerIndices := map[string]int{}
 	for i, name := range sortedNames {
-		containerIndices[name] = i
+		containerIndices[name] = nodeOffset + i
 	}
 
 	// Returns a list of networks with more than 0 containers attached
@@ -514,6 +521,10 @@ func (m *manager) highIPEndpointConfig(networkName string, containerIndex int, c
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
 		m.l.WithField("name", containerName).WithError(err).Warnf("could not inspect network %s, letting Docker assign IP", networkName)
+		return nil
+	}
+
+	if networkInfo.Options["com.docker.network.bridge.default_bridge"] == "true" {
 		return nil
 	}
 
