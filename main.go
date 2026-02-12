@@ -384,12 +384,26 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			return err
 		}
 
-		m.l.WithField("name", config.Name).Debugf("Networks to connect: %s", networks)
-		for _, n := range networks {
-			m.l.WithField("name", config.Name).Debugf("Connecting %s to network %s", config.Name, n)
+		// Connect local networks before starting so the container has them at boot
+		localNetworks, overlayNetworks := m.splitNetworksByScope(networks)
+		for _, n := range localNetworks {
 			m.connectNetworkHighIP(n, c.ID, config.Name)
 		}
 
+		m.l.WithField("name", config.Name).Infof("Starting container %s with id %s\n", config.Name, c.ID)
+		err = m.cli.ContainerStart(m.ctx, c.ID, container.StartOptions{})
+		if err != nil {
+			return err
+		}
+		m.l.WithField("name", config.Name).Infof("Started container %s with id %s\n", config.Name, c.ID)
+
+		// Connect overlay networks after start so the handshake happens immediately
+		// and NetworkConnect returns the real error on IP conflict
+		for _, n := range overlayNetworks {
+			m.connectNetworkHighIP(n, c.ID, config.Name)
+		}
+
+		return nil
 	}
 
 	c := m.getContainer(config.Name)
@@ -486,6 +500,23 @@ func (m *manager) detachNetwork(network string, container string) {
 // attach from network from container
 func (m *manager) attachNetwork(networkName string, containerName string) {
 	m.connectNetworkHighIP(networkName, containerName, containerName)
+}
+
+// splitNetworksByScope separates networks into local and overlay (swarm-scoped).
+func (m *manager) splitNetworksByScope(networks []string) (local []string, overlay []string) {
+	for _, n := range networks {
+		info, err := m.cli.NetworkInspect(m.ctx, n, types.NetworkInspectOptions{})
+		if err != nil {
+			local = append(local, n)
+			continue
+		}
+		if info.Scope == "swarm" {
+			overlay = append(overlay, n)
+		} else {
+			local = append(local, n)
+		}
+	}
+	return
 }
 
 // connectNetworkHighIP connects a container to a network using an IP from the
