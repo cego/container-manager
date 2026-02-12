@@ -105,7 +105,10 @@ func root(_ *cobra.Command, _ []string) {
 		l.Level = level
 	}
 
-	mgmt, err := NewManager(l)
+	overlayContainers := lo.CountBy(config.Containers, func(c Container) bool {
+		return c.AttachAllNetwork
+	})
+	mgmt, err := NewManager(l, overlayContainers)
 	if err != nil {
 		l.Error(err)
 		os.Exit(1)
@@ -178,40 +181,38 @@ func loadConfig(l *logrus.Logger, configFile string) *Config {
 }
 
 type manager struct {
-	l   *logrus.Logger
-	ctx context.Context
-	cli *client.Client
+	l          *logrus.Logger
+	ctx        context.Context
+	cli        *client.Client
+	nodeOffset int
 }
 
-func NewManager(l *logrus.Logger) (*manager, error) {
+func NewManager(l *logrus.Logger, overlayContainers int) (*manager, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
 
-	return &manager{l, ctx, cli}, nil
+	nodeOffset := 0
+	if overlayContainers > 0 {
+		info, err := cli.Info(ctx)
+		if err == nil && info.Swarm.NodeID != "" {
+			slots := min(32, 250/overlayContainers)
+			h := fnv.New32a()
+			h.Write([]byte(info.Swarm.NodeID))
+			nodeOffset = int(h.Sum32()%uint32(slots)) * overlayContainers
+			l.Infof("Swarm node %s, IP offset %d (%d overlay containers, %d slots)", info.Swarm.NodeID, nodeOffset, overlayContainers, slots)
+		}
+	}
+
+	return &manager{l, ctx, cli, nodeOffset}, nil
 }
 
 func (m *manager) run(config *Config) {
 	containerNames := lo.FilterMap(config.Containers, func(c Container, _ int) (string, bool) {
 		return c.Name, c.AttachAllNetwork
 	})
-
-	// Build sorted index for deterministic IP assignment from the upper range.
-	// nodeOffset ensures each swarm node picks a different IP block.
-	nodeOffset := 0
-	if info, err := m.cli.Info(m.ctx); err == nil && info.Swarm.NodeID != "" {
-		h := fnv.New32a()
-		h.Write([]byte(info.Swarm.NodeID))
-		nodeOffset = int(h.Sum32()%128) * len(config.Containers)
-	}
-	sortedNames := lo.Map(config.Containers, func(c Container, _ int) string { return c.Name })
-	slices.Sort(sortedNames)
-	containerIndices := map[string]int{}
-	for i, name := range sortedNames {
-		containerIndices[name] = nodeOffset + i
-	}
 
 	// Returns a list of networks with more than 0 containers attached
 	networkNames, err := m.getNetworkNames(containerNames)
@@ -230,14 +231,14 @@ func (m *manager) run(config *Config) {
 		}
 		networks = lo.Ternary(len(networks) > 0, networks, []string{"bridge"})
 
-		err = m.ensureContainer(c, networks, containerIndices[c.Name])
+		err = m.ensureContainer(c, networks)
 		if err != nil {
 			m.l.WithField("name", c.Name).WithError(err).Errorf("failed to enure container %s", c.Name)
 		}
 	}
 }
 
-func (m *manager) ensureContainer(config Container, networks []string, containerIndex int) error {
+func (m *manager) ensureContainer(config Container, networks []string) error {
 	containers, err := m.cli.ContainerList(m.ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
 	if err != nil {
 		return err
@@ -283,7 +284,7 @@ func (m *manager) ensureContainer(config Container, networks []string, container
 					return e.Name == config.Name
 				})
 				if !alreadyAttached {
-					m.attachNetwork(n, config.Name, containerIndex)
+					m.connectNetworkHighIP(n, config.Name, config.Name)
 				}
 			}
 
@@ -400,16 +401,20 @@ func (m *manager) ensureContainer(config Container, networks []string, container
 			return err
 		}
 
-		m.l.WithField("name", config.Name).Debugf("Networks to connect: %s", networks)
+		m.l.WithField("name", config.Name).Infof("Starting container %s with id %s\n", config.Name, c.ID)
+		err = m.cli.ContainerStart(m.ctx, c.ID, container.StartOptions{})
+		if err != nil {
+			return err
+		}
+		m.l.WithField("name", config.Name).Infof("Started container %s with id %s\n", config.Name, c.ID)
+
+		// Connect networks after start so overlay handshakes happen immediately
+		// and NetworkConnect returns the real error on IP conflict
 		for _, n := range networks {
-			m.l.WithField("name", config.Name).Debugf("Connecting %s to network %s", config.Name, n)
-			endpointConfig := m.highIPEndpointConfig(n, containerIndex, config.Name)
-			err = m.cli.NetworkConnect(m.ctx, n, c.ID, endpointConfig)
-			if err != nil {
-				m.l.WithField("name", config.Name).WithError(err).Errorf("failed to connect network %s", n)
-			}
+			m.connectNetworkHighIP(n, c.ID, config.Name)
 		}
 
+		return nil
 	}
 
 	c := m.getContainer(config.Name)
@@ -503,24 +508,45 @@ func (m *manager) detachNetwork(network string, container string) {
 	}
 }
 
-// attach from network from container
-func (m *manager) attachNetwork(networkName string, containerName string, containerIndex int) {
-	endpointConfig := m.highIPEndpointConfig(networkName, containerIndex, containerName)
-	err := m.cli.NetworkConnect(m.ctx, networkName, containerName, endpointConfig)
-	if err != nil {
-		m.l.Error(err)
+// connectNetworkHighIP connects a container to a network using an IP from the
+// upper end of the subnet. If the chosen IP conflicts (e.g. used on another
+// swarm node), it retries with the next IP down, up to 100 attempts.
+func (m *manager) connectNetworkHighIP(networkName string, containerID string, containerName string) {
+	candidates := m.highIPCandidates(networkName, containerName)
+	if candidates == nil {
+		err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
+		if err != nil {
+			m.l.WithField("name", containerName).WithError(err).Errorf("failed to connect network %s", networkName)
+		}
+		return
 	}
-	m.l.Debugf("Attaching %s to network %s\n", containerName, networkName)
+
+	for _, ip := range candidates {
+		endpointConfig := &network.EndpointSettings{
+			IPAMConfig: &network.EndpointIPAMConfig{
+				IPv4Address: ip.String(),
+			},
+		}
+		err := m.cli.NetworkConnect(m.ctx, networkName, containerID, endpointConfig)
+		if err == nil {
+			m.l.WithField("name", containerName).Infof("Assigned IP %s on network %s", ip, networkName)
+			return
+		}
+		m.l.WithField("name", containerName).Debugf("IP %s taken on network %s, trying next", ip, networkName)
+	}
+
+	m.l.WithField("name", containerName).Warnf("exhausted 100 high IPs on network %s, letting Docker assign", networkName)
+	err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
+	if err != nil {
+		m.l.WithField("name", containerName).WithError(err).Errorf("failed to connect network %s", networkName)
+	}
 }
 
-// highIPEndpointConfig returns EndpointSettings with an IP from the upper end of
-// the network's subnet. containerIndex determines the offset from the top, so
-// multiple containers on the same node get distinct IPs without racing.
-// Returns nil (Docker picks IP) if the network can't be inspected or has no IPAM config.
-func (m *manager) highIPEndpointConfig(networkName string, containerIndex int, containerName string) *network.EndpointSettings {
+// highIPCandidates returns up to 100 free IPs from the top of the network's
+// subnet, or nil if static IP assignment should be skipped.
+func (m *manager) highIPCandidates(networkName string, containerName string) []net.IP {
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
-		m.l.WithField("name", containerName).WithError(err).Warnf("could not inspect network %s, letting Docker assign IP", networkName)
 		return nil
 	}
 
@@ -528,14 +554,16 @@ func (m *manager) highIPEndpointConfig(networkName string, containerIndex int, c
 		return nil
 	}
 
+	if networkInfo.Options["com.docker.network.bridge.name"] == "docker_gwbridge" {
+		return nil
+	}
+
 	if len(networkInfo.IPAM.Config) == 0 {
-		m.l.WithField("name", containerName).Warnf("no IPAM config for network %s, letting Docker assign IP", networkName)
 		return nil
 	}
 
 	_, ipNet, err := net.ParseCIDR(networkInfo.IPAM.Config[0].Subnet)
 	if err != nil {
-		m.l.WithField("name", containerName).WithError(err).Warnf("could not parse subnet for network %s, letting Docker assign IP", networkName)
 		return nil
 	}
 
@@ -550,27 +578,22 @@ func (m *manager) highIPEndpointConfig(networkName string, containerIndex int, c
 		usedIPs = append(usedIPs, gw)
 	}
 
-	// Walk from broadcast-1 downward, picking the containerIndex-th free IP
+	var candidates []net.IP
 	broadcast := broadcastAddr(ipNet)
 	candidate := prevIP(broadcast)
 	skipped := 0
-	for ; ipNet.Contains(candidate) && !candidate.Equal(ipNet.IP); candidate = prevIP(candidate) {
+	for ; ipNet.Contains(candidate) && !candidate.Equal(ipNet.IP) && len(candidates) < 100; candidate = prevIP(candidate) {
 		if lo.Contains(usedIPs, candidate.String()) {
 			continue
 		}
-		if skipped == containerIndex {
-			m.l.WithField("name", containerName).Infof("Assigning IP %s on network %s", candidate, networkName)
-			return &network.EndpointSettings{
-				IPAMConfig: &network.EndpointIPAMConfig{
-					IPv4Address: candidate.String(),
-				},
-			}
+		if skipped < m.nodeOffset {
+			skipped++
+			continue
 		}
-		skipped++
+		candidates = append(candidates, candidate)
 	}
 
-	m.l.WithField("name", containerName).Warnf("no available IP in upper range of network %s, letting Docker assign", networkName)
-	return nil
+	return candidates
 }
 
 func broadcastAddr(n *net.IPNet) net.IP {
