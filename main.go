@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -104,7 +105,10 @@ func root(_ *cobra.Command, _ []string) {
 		l.Level = level
 	}
 
-	mgmt, err := NewManager(l)
+	overlayContainers := lo.CountBy(config.Containers, func(c Container) bool {
+		return c.AttachAllNetwork
+	})
+	mgmt, err := NewManager(l, overlayContainers)
 	if err != nil {
 		l.Error(err)
 		os.Exit(1)
@@ -177,19 +181,32 @@ func loadConfig(l *logrus.Logger, configFile string) *Config {
 }
 
 type manager struct {
-	l   *logrus.Logger
-	ctx context.Context
-	cli *client.Client
+	l          *logrus.Logger
+	ctx        context.Context
+	cli        *client.Client
+	nodeOffset int
 }
 
-func NewManager(l *logrus.Logger) (*manager, error) {
+func NewManager(l *logrus.Logger, overlayContainers int) (*manager, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
 
-	return &manager{l, ctx, cli}, nil
+	nodeOffset := 0
+	if overlayContainers > 0 {
+		info, err := cli.Info(ctx)
+		if err == nil && info.Swarm.NodeID != "" {
+			slots := min(32, 250/overlayContainers)
+			h := fnv.New32a()
+			h.Write([]byte(info.Swarm.NodeID))
+			nodeOffset = int(h.Sum32()%uint32(slots)) * overlayContainers
+			l.Infof("Swarm node %s, IP offset %d (%d overlay containers, %d slots)", info.Swarm.NodeID, nodeOffset, overlayContainers, slots)
+		}
+	}
+
+	return &manager{l, ctx, cli, nodeOffset}, nil
 }
 
 func (m *manager) run(config *Config) {
@@ -267,7 +284,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 					return e.Name == config.Name
 				})
 				if !alreadyAttached {
-					m.attachNetwork(n, config.Name)
+					m.connectNetworkHighIP(n, config.Name, config.Name)
 				}
 			}
 
@@ -384,12 +401,6 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 			return err
 		}
 
-		// Connect local networks before starting so the container has them at boot
-		localNetworks, overlayNetworks := m.splitNetworksByScope(networks)
-		for _, n := range localNetworks {
-			m.connectNetworkHighIP(n, c.ID, config.Name)
-		}
-
 		m.l.WithField("name", config.Name).Infof("Starting container %s with id %s\n", config.Name, c.ID)
 		err = m.cli.ContainerStart(m.ctx, c.ID, container.StartOptions{})
 		if err != nil {
@@ -397,9 +408,9 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		}
 		m.l.WithField("name", config.Name).Infof("Started container %s with id %s\n", config.Name, c.ID)
 
-		// Connect overlay networks after start so the handshake happens immediately
+		// Connect networks after start so overlay handshakes happen immediately
 		// and NetworkConnect returns the real error on IP conflict
-		for _, n := range overlayNetworks {
+		for _, n := range networks {
 			m.connectNetworkHighIP(n, c.ID, config.Name)
 		}
 
@@ -497,28 +508,6 @@ func (m *manager) detachNetwork(network string, container string) {
 	}
 }
 
-// attach from network from container
-func (m *manager) attachNetwork(networkName string, containerName string) {
-	m.connectNetworkHighIP(networkName, containerName, containerName)
-}
-
-// splitNetworksByScope separates networks into local and overlay (swarm-scoped).
-func (m *manager) splitNetworksByScope(networks []string) (local []string, overlay []string) {
-	for _, n := range networks {
-		info, err := m.cli.NetworkInspect(m.ctx, n, types.NetworkInspectOptions{})
-		if err != nil {
-			local = append(local, n)
-			continue
-		}
-		if info.Scope == "swarm" {
-			overlay = append(overlay, n)
-		} else {
-			local = append(local, n)
-		}
-	}
-	return
-}
-
 // connectNetworkHighIP connects a container to a network using an IP from the
 // upper end of the subnet. If the chosen IP conflicts (e.g. used on another
 // swarm node), it retries with the next IP down, up to 100 attempts.
@@ -592,8 +581,13 @@ func (m *manager) highIPCandidates(networkName string, containerName string) []n
 	var candidates []net.IP
 	broadcast := broadcastAddr(ipNet)
 	candidate := prevIP(broadcast)
+	skipped := 0
 	for ; ipNet.Contains(candidate) && !candidate.Equal(ipNet.IP) && len(candidates) < 100; candidate = prevIP(candidate) {
 		if lo.Contains(usedIPs, candidate.String()) {
+			continue
+		}
+		if skipped < m.nodeOffset {
+			skipped++
 			continue
 		}
 		candidates = append(candidates, candidate)
