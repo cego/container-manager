@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
-	"reflect"
-	"sort"
+	"slices"
 	"syscall"
 	"time"
 
@@ -17,7 +17,9 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"go.elastic.co/ecslogrus"
@@ -191,12 +193,17 @@ func NewManager(l *logrus.Logger) (*manager, error) {
 }
 
 func (m *manager) run(config *Config) {
-	// Create a list of container-manager containers
-	containerNames := []string{}
-	for _, c := range config.Containers {
-		if c.AttachAllNetwork {
-			containerNames = append(containerNames, c.Name)
-		}
+	containerNames := lo.FilterMap(config.Containers, func(c Container, _ int) (string, bool) {
+		return c.Name, c.AttachAllNetwork
+	})
+
+	// Build sorted index for deterministic IP assignment from the upper range.
+	// Each container gets a unique offset so containers on the same node never race for the same IP.
+	sortedNames := lo.Map(config.Containers, func(c Container, _ int) string { return c.Name })
+	slices.Sort(sortedNames)
+	containerIndices := map[string]int{}
+	for i, name := range sortedNames {
+		containerIndices[name] = i
 	}
 
 	// Returns a list of networks with more than 0 containers attached
@@ -212,22 +219,18 @@ func (m *manager) run(config *Config) {
 		var networks []string = nil
 		if c.AttachAllNetwork {
 			m.l.WithField("name", c.Name).Debugf("Attaching all networks")
-			networks = make([]string, len(networkNames))
-			copy(networks, networkNames)
-			networks = remove(networks, c.IgnoredNetworks)
+			networks = lo.Without(networkNames, c.IgnoredNetworks...)
 		}
-		if len(networks) == 0 {
-			networks = append(networks, "bridge")
-		}
+		networks = lo.Ternary(len(networks) > 0, networks, []string{"bridge"})
 
-		err = m.ensureContainer(c, networks)
+		err = m.ensureContainer(c, networks, containerIndices[c.Name])
 		if err != nil {
 			m.l.WithField("name", c.Name).WithError(err).Errorf("failed to enure container %s", c.Name)
 		}
 	}
 }
 
-func (m *manager) ensureContainer(config Container, networks []string) error {
+func (m *manager) ensureContainer(config Container, networks []string, containerIndex int) error {
 	containers, err := m.cli.ContainerList(m.ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
 	if err != nil {
 		return err
@@ -245,11 +248,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		create = true
 	} else {
 		c := containers[0]
-		networkNames := []string{}
-		for n := range c.NetworkSettings.Networks {
-			networkNames = append(networkNames, n)
-		}
-		sort.Strings(networkNames)
+		networkNames := lo.Keys(c.NetworkSettings.Networks)
 
 		if config.Image != c.Image {
 			m.l.WithField("name", config.Name).Debugf("Image differ, recreate %s", config.Name)
@@ -264,29 +263,28 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		m.l.WithField("name", config.Name).Debugf("Networks expected: %s", networks)
 		m.l.WithField("name", config.Name).Debugf("Networks current: %s", networkNames)
 
-		if !reflect.DeepEqual(networks, networkNames) {
+		if !lo.ElementsMatch(networks, networkNames) {
 			m.l.WithField("name", config.Name).Debugf("Network config differ, attach/detach %s", config.Name)
 
 			// New networks attach
-			for _, network := range networks {
-				// Inspect each network to get attached containers
-				attached, err := m.cli.NetworkInspect(m.ctx, network, types.NetworkInspectOptions{})
+			for _, n := range networks {
+				attached, err := m.cli.NetworkInspect(m.ctx, n, types.NetworkInspectOptions{})
 				if err != nil {
 					m.l.Error(err)
 				}
-
-				// If container is not already attached to network
-				if !containerInNetworks(config.Name, attached) {
-					m.attachNetwork(network, config.Name)
+				alreadyAttached := lo.SomeBy(lo.Values(attached.Containers), func(e types.EndpointResource) bool {
+					return e.Name == config.Name
+				})
+				if !alreadyAttached {
+					m.attachNetwork(n, config.Name, containerIndex)
 				}
 			}
 
-			m.l.WithField("name", config.Name).Debugf("Network detach diff: %s\n", difference(networkNames, networks))
-
 			// Old networks detach
-			for _, network := range difference(networkNames, networks) {
-				// Detach from network diff
-				m.detachNetwork(network, config.Name)
+			detach, _ := lo.Difference(networkNames, networks)
+			m.l.WithField("name", config.Name).Debugf("Network detach diff: %s\n", detach)
+			for _, n := range detach {
+				m.detachNetwork(n, config.Name)
 			}
 		}
 
@@ -297,51 +295,29 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 				return err
 			}
 			if volume.Source != "" {
-				mode := ""
-				if !volume.ReadOnly {
-					mode = ":rw"
-				} else {
-					mode = ":ro"
-				}
+				mode := lo.Ternary(volume.ReadOnly, ":ro", ":rw")
 				volumesExpected[i] = fmt.Sprintf("%s:%s%s\n", volume.Source, volume.Target, mode)
 			}
 		}
 
-		volumesCurrent := make([]string, 0)
-		for _, m := range c.Mounts {
-			src := m.Name
-			if src == "" {
-				src = m.Source
-			}
-			mode := ""
-			if m.RW {
-				mode = ":rw"
-			} else {
-				mode = ":ro"
-			}
+		volumesCurrent := lo.Map(c.Mounts, func(m types.MountPoint, _ int) string {
+			src := lo.Ternary(m.Name != "", m.Name, m.Source)
+			mode := lo.Ternary(m.RW, ":rw", ":ro")
+			return fmt.Sprintf("%s:%s%s\n", src, m.Destination, mode)
+		})
 
-			volumesCurrent = append(volumesCurrent, fmt.Sprintf("%s:%s%s\n", src, m.Destination, mode))
-		}
-
-		if !stringSlicesEqual(volumesCurrent, volumesExpected) {
+		if !lo.ElementsMatch(volumesCurrent, volumesExpected) {
 			m.l.WithField("name", config.Name).Debugf("Volume config differ, recreate %s", config.Name)
 			m.l.WithField("name", config.Name).Debugf("Volumes expected: %s", volumesExpected)
 			m.l.WithField("name", config.Name).Debugf("Volumes Current: %s", volumesCurrent)
 			reCreate = true
 		}
 
-		if len(config.Labels) > 0 {
-			for k, v := range config.Labels {
-				if val, ok := c.Labels[k]; ok {
-					if val != v {
-						reCreate = true
-						break
-					}
-				} else {
-					reCreate = true
-					break
-				}
-			}
+		labelsChanged := lo.SomeBy(lo.Entries(config.Labels), func(e lo.Entry[string, string]) bool {
+			return c.Labels[e.Key] != e.Value
+		})
+		if labelsChanged {
+			reCreate = true
 		}
 
 		state = c.State
@@ -420,7 +396,8 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		m.l.WithField("name", config.Name).Debugf("Networks to connect: %s", networks)
 		for _, n := range networks {
 			m.l.WithField("name", config.Name).Debugf("Connecting %s to network %s", config.Name, n)
-			err = m.cli.NetworkConnect(m.ctx, n, c.ID, nil)
+			endpointConfig := m.highIPEndpointConfig(n, containerIndex, config.Name)
+			err = m.cli.NetworkConnect(m.ctx, n, c.ID, endpointConfig)
 			if err != nil {
 				m.l.WithField("name", config.Name).WithError(err).Errorf("failed to connect network %s", n)
 			}
@@ -481,57 +458,31 @@ func (m *manager) stopContainers(config *Config) {
 }
 
 func (m *manager) getNetworkNames(containerNames []string) ([]string, error) {
-	names := []string{}
-
-	networks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
+	allNetworks, err := m.cli.NetworkList(m.ctx, types.NetworkListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	for _, network := range networks {
-		// Inspect each network to get attached containers
-		attached, err := m.cli.NetworkInspect(m.ctx, network.Name, types.NetworkInspectOptions{})
+	eligible := lo.Filter(allNetworks, func(n types.NetworkResource, _ int) bool {
+		return (n.Attachable || n.Scope == "local") && !lo.Contains(ignoredNetworkNames, n.Name)
+	})
+
+	var names []string
+	for _, n := range eligible {
+		attached, err := m.cli.NetworkInspect(m.ctx, n.Name, types.NetworkInspectOptions{})
 		if err != nil {
 			return nil, err
 		}
-		for _, endpoint := range attached.Containers {
-			if !containsString(containerNames, endpoint.Name) &&
-				(network.Attachable || network.Scope == "local") &&
-				!containsString(ignoredNetworkNames, network.Name) {
-				names = append(names, network.Name)
-				break
-			}
+		hasExternalContainer := lo.SomeBy(lo.Values(attached.Containers), func(e types.EndpointResource) bool {
+			return !lo.Contains(containerNames, e.Name)
+		})
+		if hasExternalContainer {
+			names = append(names, n.Name)
 		}
 	}
 
-	sort.Strings(names)
-
+	slices.Sort(names)
 	return names, nil
-}
-
-// validate if a container is in a given network
-func containerInNetworks(containerName string, attached types.NetworkResource) bool {
-	for _, c := range attached.Containers {
-		if containerName == c.Name {
-			return true
-		}
-	}
-	return false
-}
-
-// difference returns the elements in `a` that aren't in `b`.
-func difference(a, b []string) []string {
-	mb := make(map[string]struct{}, len(b))
-	for _, x := range b {
-		mb[x] = struct{}{}
-	}
-	var diff []string
-	for _, x := range a {
-		if _, found := mb[x]; !found {
-			diff = append(diff, x)
-		}
-	}
-	return diff
 }
 
 // detach from network from container
@@ -546,44 +497,91 @@ func (m *manager) detachNetwork(network string, container string) {
 }
 
 // attach from network from container
-func (m *manager) attachNetwork(network string, container string) {
-	err := m.cli.NetworkConnect(m.ctx, network, container, nil)
+func (m *manager) attachNetwork(networkName string, containerName string, containerIndex int) {
+	endpointConfig := m.highIPEndpointConfig(networkName, containerIndex, containerName)
+	err := m.cli.NetworkConnect(m.ctx, networkName, containerName, endpointConfig)
 	if err != nil {
 		m.l.Error(err)
 	}
-	m.l.Debugf("Attaching %s to network %s\n", container, network)
+	m.l.Debugf("Attaching %s to network %s\n", containerName, networkName)
 }
 
-func containsString(strings []string, s string) bool {
-	for _, a := range strings {
-		if s == a {
-			return true
-		}
+// highIPEndpointConfig returns EndpointSettings with an IP from the upper end of
+// the network's subnet. containerIndex determines the offset from the top, so
+// multiple containers on the same node get distinct IPs without racing.
+// Returns nil (Docker picks IP) if the network can't be inspected or has no IPAM config.
+func (m *manager) highIPEndpointConfig(networkName string, containerIndex int, containerName string) *network.EndpointSettings {
+	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
+	if err != nil {
+		m.l.WithField("name", containerName).WithError(err).Warnf("could not inspect network %s, letting Docker assign IP", networkName)
+		return nil
 	}
-	return false
+
+	if len(networkInfo.IPAM.Config) == 0 {
+		m.l.WithField("name", containerName).Warnf("no IPAM config for network %s, letting Docker assign IP", networkName)
+		return nil
+	}
+
+	_, ipNet, err := net.ParseCIDR(networkInfo.IPAM.Config[0].Subnet)
+	if err != nil {
+		m.l.WithField("name", containerName).WithError(err).Warnf("could not parse subnet for network %s, letting Docker assign IP", networkName)
+		return nil
+	}
+
+	usedIPs := lo.FilterMap(lo.Values(networkInfo.Containers), func(e types.EndpointResource, _ int) (string, bool) {
+		ip, _, err := net.ParseCIDR(e.IPv4Address)
+		if err != nil {
+			return "", false
+		}
+		return ip.String(), true
+	})
+	if gw := networkInfo.IPAM.Config[0].Gateway; gw != "" {
+		usedIPs = append(usedIPs, gw)
+	}
+
+	// Walk from broadcast-1 downward, picking the containerIndex-th free IP
+	broadcast := broadcastAddr(ipNet)
+	candidate := prevIP(broadcast)
+	skipped := 0
+	for ; ipNet.Contains(candidate) && !candidate.Equal(ipNet.IP); candidate = prevIP(candidate) {
+		if lo.Contains(usedIPs, candidate.String()) {
+			continue
+		}
+		if skipped == containerIndex {
+			m.l.WithField("name", containerName).Infof("Assigning IP %s on network %s", candidate, networkName)
+			return &network.EndpointSettings{
+				IPAMConfig: &network.EndpointIPAMConfig{
+					IPv4Address: candidate.String(),
+				},
+			}
+		}
+		skipped++
+	}
+
+	m.l.WithField("name", containerName).Warnf("no available IP in upper range of network %s, letting Docker assign", networkName)
+	return nil
 }
 
-func stringSlicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+func broadcastAddr(n *net.IPNet) net.IP {
+	ip := n.IP.To4()
+	if ip == nil {
+		ip = n.IP.To16()
 	}
-	sort.Strings(a)
-	sort.Strings(b)
-
-	for i, v := range a {
-		if v != b[i] {
-			return false
-		}
+	broadcast := make(net.IP, len(ip))
+	for i := range ip {
+		broadcast[i] = ip[i] | ^n.Mask[i]
 	}
-	return true
+	return broadcast
 }
 
-func remove(slice []string, values []string) []string {
-	var r []string
-	for _, v := range slice {
-		if !containsString(values, v) {
-			r = append(r, v)
+func prevIP(ip net.IP) net.IP {
+	prev := make(net.IP, len(ip))
+	copy(prev, ip)
+	for i := len(prev) - 1; i >= 0; i-- {
+		prev[i]--
+		if prev[i] != 255 {
+			break
 		}
 	}
-	return r
+	return prev
 }
