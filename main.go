@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"slices"
+	"sort"
 	"syscall"
 	"time"
 
@@ -181,10 +181,11 @@ func loadConfig(l *logrus.Logger, configFile string) *Config {
 }
 
 type manager struct {
-	l          *logrus.Logger
-	ctx        context.Context
-	cli        *client.Client
-	nodeOffset int
+	l                 *logrus.Logger
+	ctx               context.Context
+	cli               *client.Client
+	nodeAddr          string
+	overlayContainers int
 }
 
 func NewManager(l *logrus.Logger, overlayContainers int) (*manager, error) {
@@ -194,19 +195,16 @@ func NewManager(l *logrus.Logger, overlayContainers int) (*manager, error) {
 		return nil, err
 	}
 
-	nodeOffset := 0
+	var nodeAddr string
 	if overlayContainers > 0 {
 		info, err := cli.Info(ctx)
-		if err == nil && info.Swarm.NodeID != "" {
-			slots := min(32, 250/overlayContainers)
-			h := fnv.New32a()
-			h.Write([]byte(info.Swarm.NodeID))
-			nodeOffset = int(h.Sum32()%uint32(slots)) * overlayContainers
-			l.Infof("Swarm node %s, IP offset %d (%d overlay containers, %d slots)", info.Swarm.NodeID, nodeOffset, overlayContainers, slots)
+		if err == nil && info.Swarm.NodeAddr != "" {
+			nodeAddr = info.Swarm.NodeAddr
+			l.Infof("Swarm node %s (addr %s), %d overlay containers", info.Swarm.NodeID, nodeAddr, overlayContainers)
 		}
 	}
 
-	return &manager{l, ctx, cli, nodeOffset}, nil
+	return &manager{l: l, ctx: ctx, cli: cli, nodeAddr: nodeAddr, overlayContainers: overlayContainers}, nil
 }
 
 func (m *manager) run(config *Config) {
@@ -509,8 +507,8 @@ func (m *manager) detachNetwork(network string, container string) {
 }
 
 // connectNetworkHighIP connects a container to a network using an IP from the
-// upper end of the subnet. If the chosen IP conflicts (e.g. used on another
-// swarm node), it retries with the next IP down, up to 100 attempts.
+// upper end of the subnet. If the chosen IP conflicts, it falls back to
+// Docker-assigned.
 func (m *manager) connectNetworkHighIP(networkName string, containerID string, containerName string) {
 	candidates := m.highIPCandidates(networkName, containerName)
 	if candidates == nil {
@@ -535,15 +533,15 @@ func (m *manager) connectNetworkHighIP(networkName string, containerID string, c
 		m.l.WithField("name", containerName).Debugf("IP %s taken on network %s, trying next", ip, networkName)
 	}
 
-	m.l.WithField("name", containerName).Warnf("exhausted 100 high IPs on network %s, letting Docker assign", networkName)
+	m.l.WithField("name", containerName).Warnf("all candidate IPs taken on network %s, letting Docker assign", networkName)
 	err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
 	if err != nil {
 		m.l.WithField("name", containerName).WithError(err).Errorf("failed to connect network %s", networkName)
 	}
 }
 
-// highIPCandidates returns up to 100 free IPs from the top of the network's
-// subnet, or nil if static IP assignment should be skipped.
+// highIPCandidates returns IPs from a tight band at the top of the network's
+// subnet, using the overlay Peers list for deterministic per-node positioning.
 func (m *manager) highIPCandidates(networkName string, containerName string) []net.IP {
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
@@ -567,30 +565,33 @@ func (m *manager) highIPCandidates(networkName string, containerName string) []n
 		return nil
 	}
 
-	usedIPs := lo.FilterMap(lo.Values(networkInfo.Containers), func(e types.EndpointResource, _ int) (string, bool) {
-		ip, _, err := net.ParseCIDR(e.IPv4Address)
-		if err != nil {
-			return "", false
-		}
-		return ip.String(), true
-	})
-	if gw := networkInfo.IPAM.Config[0].Gateway; gw != "" {
-		usedIPs = append(usedIPs, gw)
+	if len(networkInfo.Peers) == 0 {
+		return nil
 	}
 
-	var candidates []net.IP
+	peerIPs := make([]string, len(networkInfo.Peers))
+	for i, p := range networkInfo.Peers {
+		peerIPs[i] = p.IP
+	}
+	sort.Strings(peerIPs)
+
+	peerIndex := len(peerIPs)
+	for i, ip := range peerIPs {
+		if ip == m.nodeAddr {
+			peerIndex = i
+			break
+		}
+	}
+
 	broadcast := broadcastAddr(ipNet)
-	candidate := prevIP(broadcast)
-	skipped := 0
-	for ; ipNet.Contains(candidate) && !candidate.Equal(ipNet.IP) && len(candidates) < 100; candidate = prevIP(candidate) {
-		if lo.Contains(usedIPs, candidate.String()) {
-			continue
+	startOffset := 1 + peerIndex*m.overlayContainers
+	var candidates []net.IP
+	for i := range m.overlayContainers {
+		ip := addToIP(broadcast, -(startOffset + i))
+		if !ipNet.Contains(ip) || ip.Equal(ipNet.IP) {
+			break
 		}
-		if skipped < m.nodeOffset {
-			skipped++
-			continue
-		}
-		candidates = append(candidates, candidate)
+		candidates = append(candidates, ip)
 	}
 
 	return candidates
@@ -608,14 +609,14 @@ func broadcastAddr(n *net.IPNet) net.IP {
 	return broadcast
 }
 
-func prevIP(ip net.IP) net.IP {
-	prev := make(net.IP, len(ip))
-	copy(prev, ip)
-	for i := len(prev) - 1; i >= 0; i-- {
-		prev[i]--
-		if prev[i] != 255 {
-			break
-		}
+func addToIP(ip net.IP, delta int) net.IP {
+	result := make(net.IP, len(ip))
+	copy(result, ip)
+	carry := delta
+	for i := len(result) - 1; i >= 0 && carry != 0; i-- {
+		sum := int(result[i]) + carry
+		result[i] = byte(sum & 0xFF)
+		carry = sum >> 8
 	}
-	return prev
+	return result
 }
