@@ -573,20 +573,25 @@ func (m *manager) highIPCandidates(networkName string, containerName string) []n
 	for i, p := range networkInfo.Peers {
 		peerIPs[i] = p.IP
 	}
+
+	return computeIPCandidates(ipNet, peerIPs, m.nodeAddr, m.overlayContainers)
+}
+
+func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int) []net.IP {
 	sort.Strings(peerIPs)
 
 	peerIndex := len(peerIPs)
 	for i, ip := range peerIPs {
-		if ip == m.nodeAddr {
+		if ip == nodeAddr {
 			peerIndex = i
 			break
 		}
 	}
 
 	broadcast := broadcastAddr(ipNet)
-	startOffset := 1 + peerIndex*m.overlayContainers
+	startOffset := 1 + peerIndex*overlayContainers
 	var candidates []net.IP
-	for i := range m.overlayContainers {
+	for i := range overlayContainers {
 		ip := addToIP(broadcast, -(startOffset + i))
 		if !ipNet.Contains(ip) || ip.Equal(ipNet.IP) {
 			break

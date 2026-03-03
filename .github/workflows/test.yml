@@ -1,0 +1,24 @@
+name: Test
+
+permissions:
+  contents: read
+
+on: [push]
+
+jobs:
+  test:
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Install dependencies
+        run: go get .
+      - name: Test
+        run: go test -v ./...
