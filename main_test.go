@@ -125,15 +125,13 @@ func TestComputeIPCandidates(t *testing.T) {
 		for i := range peers {
 			peers[i] = fmt.Sprintf("10.0.1.%d", i+1)
 		}
-		sorted := slices.Clone(peers)
-		slices.Sort(sorted)
 
-		// First sorted peer (idx 0): broadcast-1, broadcast-2
-		assertIPs(t, "first peer", computeIPCandidates(ipNet, peers, sorted[0], 2),
+		// Numeric sort: 10.0.1.1 is first (idx 0), 10.0.1.48 is last (idx 47)
+		assertIPs(t, "first peer", computeIPCandidates(ipNet, peers, "10.0.1.1", 2),
 			[]string{"10.0.1.254", "10.0.1.253"})
 
-		// Last sorted peer (idx 47): startOffset = 1+47*2 = 95
-		assertIPs(t, "last peer", computeIPCandidates(ipNet, peers, sorted[47], 2),
+		// Last peer (idx 47): startOffset = 1+47*2 = 95
+		assertIPs(t, "last peer", computeIPCandidates(ipNet, peers, "10.0.1.48", 2),
 			[]string{"10.0.1.160", "10.0.1.159"})
 
 		// Band = 96 IPs (.254 down to .159), leaves 158 for swarm
@@ -159,23 +157,18 @@ func TestComputeIPCandidates(t *testing.T) {
 		for i := range peers {
 			peers[i] = fmt.Sprintf("10.0.0.%d", i+1)
 		}
-		sorted := slices.Clone(peers)
-		slices.Sort(sorted)
-		firstPeer := sorted[0]
-		lastPeer := sorted[99]
 
-		first := computeIPCandidates(ipNet, peers, firstPeer, 3)
-		if len(first) != 3 {
-			t.Fatalf("first peer: got %d IPs, want 3", len(first))
-		}
-		if first[0].String() != "172.16.255.254" {
-			t.Errorf("first peer IP[0]: got %s, want 172.16.255.254", first[0])
-		}
+		// Numeric sort: 10.0.0.1 is first (idx 0), 10.0.0.100 is last (idx 99)
+		assertIPs(t, "first peer",
+			computeIPCandidates(ipNet, peers, "10.0.0.1", 3),
+			[]string{"172.16.255.254", "172.16.255.253", "172.16.255.252"})
 
-		last := computeIPCandidates(ipNet, peers, lastPeer, 3)
-		if len(last) != 3 {
-			t.Fatalf("last peer: got %d IPs, want 3", len(last))
-		}
+		// Last peer (idx 99): startOffset = 1 + 99*3 = 298
+		// broadcast - 298 = 172.16.255.255 - 298 = 172.16.254.213
+		assertIPs(t, "last peer",
+			computeIPCandidates(ipNet, peers, "10.0.0.100", 3),
+			[]string{"172.16.254.213", "172.16.254.212", "172.16.254.211"})
+
 		// Total band = 300 IPs out of 65534 usable
 	})
 
@@ -185,14 +178,14 @@ func TestComputeIPCandidates(t *testing.T) {
 		for i := range peers {
 			peers[i] = fmt.Sprintf("10.1.0.%d", i+1)
 		}
-		sorted := slices.Clone(peers)
-		slices.Sort(sorted)
 
+		// Numeric sort: 10.1.0.1 is first, 10.1.0.50 is last
 		assertIPs(t, "first peer",
-			computeIPCandidates(ipNet, peers, sorted[0], 4),
+			computeIPCandidates(ipNet, peers, "10.1.0.1", 4),
 			[]string{"10.0.71.254", "10.0.71.253", "10.0.71.252", "10.0.71.251"})
 
-		last := computeIPCandidates(ipNet, peers, sorted[49], 4)
+		// Last peer (idx 49): startOffset = 1 + 49*4 = 197
+		last := computeIPCandidates(ipNet, peers, "10.1.0.50", 4)
 		if len(last) != 4 {
 			t.Fatalf("last peer: got %d IPs, want 4", len(last))
 		}
@@ -341,6 +334,46 @@ func TestComputeIPCandidates(t *testing.T) {
 		}
 	})
 
+	t.Run("numeric sort: 10.0.0.10 sorts after 10.0.0.9 not after 10.0.0.1", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.1.0/24")
+		peers := []string{"10.0.0.1", "10.0.0.9", "10.0.0.10"}
+
+		// Numeric order: .1 (idx 0), .9 (idx 1), .10 (idx 2)
+		// If lexicographic, .10 would be at idx 1 and .9 at idx 2
+		assertIPs(t, ".9 at idx 1",
+			computeIPCandidates(ipNet, peers, "10.0.0.9", 1),
+			[]string{"10.0.1.253"})
+		assertIPs(t, ".10 at idx 2",
+			computeIPCandidates(ipNet, peers, "10.0.0.10", 1),
+			[]string{"10.0.1.252"})
+	})
+
+	t.Run("adding node 10 to 9-node cluster does not shift existing bands", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+
+		peers9 := make([]string, 9)
+		for i := range peers9 {
+			peers9[i] = fmt.Sprintf("10.0.0.%d", i+1)
+		}
+		// Record all 9 nodes' bands
+		before := make(map[string][]string)
+		for _, peer := range peers9 {
+			before[peer] = ipsToStrings(computeIPCandidates(ipNet, peers9, peer, 2))
+		}
+
+		// Add 10.0.0.10 — numeric sort puts it last
+		peers10 := append(slices.Clone(peers9), "10.0.0.10")
+		for _, peer := range peers9 {
+			after := ipsToStrings(computeIPCandidates(ipNet, peers10, peer, 2))
+			for i := range before[peer] {
+				if before[peer][i] != after[i] {
+					t.Errorf("peer %s band changed after adding .10: %v → %v", peer, before[peer], after)
+					break
+				}
+			}
+		}
+	})
+
 	t.Run("adding a peer preserves earlier peers bands", func(t *testing.T) {
 		ipNet := mustParseCIDR(t, "10.0.64.0/21")
 
@@ -424,16 +457,14 @@ func TestComputeIPCandidates(t *testing.T) {
 		for i := range peers {
 			peers[i] = fmt.Sprintf("10.0.0.%d", i+1)
 		}
-		sorted := slices.Clone(peers)
-		slices.Sort(sorted)
 
-		// First peer: .14, .13 — fits
+		// Numeric sort: 10.0.0.1 is first (idx 0), first peer: .14, .13 — fits
 		assertIPs(t, "first peer",
-			computeIPCandidates(ipNet, peers, sorted[0], 2),
+			computeIPCandidates(ipNet, peers, "10.0.0.1", 2),
 			[]string{"192.168.1.14", "192.168.1.13"})
 
-		// Peer at index 7: startOffset = 1+7*2 = 15, broadcast(.15) - 15 = .0 = network addr → no candidates
-		got := computeIPCandidates(ipNet, peers, sorted[7], 2)
+		// Peer at index 7 (10.0.0.8): startOffset = 1+7*2 = 15, broadcast(.15) - 15 = .0 = network addr → no candidates
+		got := computeIPCandidates(ipNet, peers, "10.0.0.8", 2)
 		if len(got) != 0 {
 			t.Errorf("peer at index 7 on /28: got %v, want empty (exceeds subnet)", ipsToStrings(got))
 		}

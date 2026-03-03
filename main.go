@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -509,7 +510,7 @@ func (m *manager) detachNetwork(network string, container string) {
 // upper end of the subnet. If the chosen IP conflicts, it falls back to
 // Docker-assigned.
 func (m *manager) connectNetworkHighIP(networkName string, containerID string, containerName string) {
-	candidates := m.highIPCandidates(networkName, containerName)
+	candidates := m.highIPCandidates(networkName)
 	if candidates == nil {
 		err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
 		if err != nil {
@@ -541,7 +542,7 @@ func (m *manager) connectNetworkHighIP(networkName string, containerID string, c
 
 // highIPCandidates returns IPs from a tight band at the top of the network's
 // subnet, using the overlay Peers list for deterministic per-node positioning.
-func (m *manager) highIPCandidates(networkName string, containerName string) []net.IP {
+func (m *manager) highIPCandidates(networkName string) []net.IP {
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
 		return nil
@@ -578,7 +579,9 @@ func (m *manager) highIPCandidates(networkName string, containerName string) []n
 
 func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int) []net.IP {
 	peerIPs = slices.Clone(peerIPs)
-	slices.Sort(peerIPs)
+	slices.SortFunc(peerIPs, func(a, b string) int {
+		return bytes.Compare(net.ParseIP(a).To4(), net.ParseIP(b).To4())
+	})
 
 	peerIndex := len(peerIPs)
 	for i, ip := range peerIPs {
