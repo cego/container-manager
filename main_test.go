@@ -526,3 +526,157 @@ func TestComputeIPCandidates(t *testing.T) {
 		}
 	})
 }
+
+// candidateForOverlayIndex mirrors the indexing logic in highIPCandidates:
+// compute the full band, then return only the IP for the given overlay index.
+func candidateForOverlayIndex(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int, overlayIndex int) net.IP {
+	candidates := computeIPCandidates(ipNet, peerIPs, nodeAddr, overlayContainers)
+	if overlayIndex >= len(candidates) {
+		return nil
+	}
+	return candidates[overlayIndex]
+}
+
+func TestOverlayIndexSelection(t *testing.T) {
+	t.Run("two containers on same node get different IPs", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+
+		ip0 := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 0)
+		ip1 := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 1)
+
+		if ip0 == nil || ip1 == nil {
+			t.Fatalf("got nil: ip0=%v ip1=%v", ip0, ip1)
+		}
+		if ip0.Equal(ip1) {
+			t.Errorf("both containers got same IP: %s", ip0)
+		}
+		if ip0.String() != "10.0.71.254" {
+			t.Errorf("container 0: got %s, want 10.0.71.254", ip0)
+		}
+		if ip1.String() != "10.0.71.253" {
+			t.Errorf("container 1: got %s, want 10.0.71.253", ip1)
+		}
+	})
+
+	t.Run("three containers on same node all get unique IPs", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.1.0/24")
+		peers := []string{"10.0.0.1", "10.0.0.2"}
+
+		seen := map[string]int{}
+		for i := range 3 {
+			ip := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 3, i)
+			if ip == nil {
+				t.Fatalf("container %d got nil", i)
+			}
+			if prev, exists := seen[ip.String()]; exists {
+				t.Errorf("container %d and %d both got %s", prev, i, ip)
+			}
+			seen[ip.String()] = i
+		}
+	})
+
+	t.Run("overlay index out of bounds returns nil", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.1.0/24")
+		peers := []string{"10.0.0.1"}
+
+		ip := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 2)
+		if ip != nil {
+			t.Errorf("index 2 with 2 containers: got %s, want nil", ip)
+		}
+
+		ip = candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 99)
+		if ip != nil {
+			t.Errorf("index 99 with 2 containers: got %s, want nil", ip)
+		}
+	})
+
+	t.Run("containers on different nodes never collide", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+		overlayContainers := 3
+
+		seen := map[string]string{}
+		for _, peer := range peers {
+			for i := range overlayContainers {
+				ip := candidateForOverlayIndex(ipNet, peers, peer, overlayContainers, i)
+				if ip == nil {
+					continue
+				}
+				key := ip.String()
+				label := fmt.Sprintf("%s[%d]", peer, i)
+				if prev, exists := seen[key]; exists {
+					t.Errorf("IP %s assigned to %s and %s", key, prev, label)
+				}
+				seen[key] = label
+			}
+		}
+	})
+
+	t.Run("simulates run() overlay index counting", func(t *testing.T) {
+		// Config: [non-overlay, heartbeat (overlay), non-overlay, metricbeat (overlay)]
+		type fakeContainer struct {
+			name    string
+			overlay bool
+		}
+		containers := []fakeContainer{
+			{"logger", false},
+			{"heartbeat", true},
+			{"proxy", false},
+			{"metricbeat", true},
+		}
+
+		ipNet := mustParseCIDR(t, "10.0.1.0/24")
+		peers := []string{"10.0.0.1", "10.0.0.2"}
+
+		overlayIndex := 0
+		results := map[string]net.IP{}
+		for _, c := range containers {
+			currentIndex := overlayIndex
+			if c.overlay {
+				overlayIndex++
+			}
+			if c.overlay {
+				ip := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, currentIndex)
+				results[c.name] = ip
+			}
+		}
+
+		if results["heartbeat"].String() != "10.0.1.254" {
+			t.Errorf("heartbeat: got %s, want 10.0.1.254", results["heartbeat"])
+		}
+		if results["metricbeat"].String() != "10.0.1.253" {
+			t.Errorf("metricbeat: got %s, want 10.0.1.253", results["metricbeat"])
+		}
+		if results["heartbeat"].Equal(results["metricbeat"]) {
+			t.Errorf("heartbeat and metricbeat got same IP: %s", results["heartbeat"])
+		}
+	})
+
+	t.Run("/30 with 2 containers — second has no room on second peer", func(t *testing.T) {
+		// /30: 2 usable IPs. Peer 0 band = [.2, .1]. Peer 1 band = [.0] but .0 = network → empty.
+		// So peer 1 container 0 gets nil, container 1 also nil.
+		ipNet := mustParseCIDR(t, "10.0.0.0/30")
+		peers := []string{"10.0.0.1", "10.0.0.2"}
+
+		// Peer 0: band has 1 IP (.2), container 0 gets it, container 1 gets nil
+		ip := candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 0)
+		if ip == nil || ip.String() != "10.0.0.2" {
+			t.Errorf("peer0 container0: got %v, want 10.0.0.2", ip)
+		}
+		ip = candidateForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 1)
+		if ip == nil || ip.String() != "10.0.0.1" {
+			t.Errorf("peer0 container1: got %v, want 10.0.0.1", ip)
+		}
+
+		// Peer 1: startOffset = 1+1*2 = 3, broadcast-3 = .0 = network → empty band
+		ip = candidateForOverlayIndex(ipNet, peers, "10.0.0.2", 2, 0)
+		if ip != nil {
+			t.Errorf("peer1 container0: got %s, want nil", ip)
+		}
+		ip = candidateForOverlayIndex(ipNet, peers, "10.0.0.2", 2, 1)
+		if ip != nil {
+			t.Errorf("peer1 container1: got %s, want nil", ip)
+		}
+	})
+}
