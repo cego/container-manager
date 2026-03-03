@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"sort"
 	"syscall"
 	"time"
 
@@ -578,7 +577,8 @@ func (m *manager) highIPCandidates(networkName string, containerName string) []n
 }
 
 func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int) []net.IP {
-	sort.Strings(peerIPs)
+	peerIPs = slices.Clone(peerIPs)
+	slices.Sort(peerIPs)
 
 	peerIndex := len(peerIPs)
 	for i, ip := range peerIPs {
