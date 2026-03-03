@@ -497,16 +497,24 @@ func TestComputeIPCandidates(t *testing.T) {
 			[]string{"10.0.0.2", "10.0.0.1"})
 	})
 
-	t.Run("/30 minimal subnet, 2 peers — second peer has no room", func(t *testing.T) {
-		// peer 0 gets .2, peer 1 needs broadcast-3 = .0 = network addr → no candidates
+	t.Run("/30 minimal subnet, 2 peers each get 1 IP", func(t *testing.T) {
+		// /30: network=.0, broadcast=.3, usable=.1 and .2
+		// peer 0: startOffset=1 → .2; peer 1: startOffset=2 → .1
 		ipNet := mustParseCIDR(t, "10.0.0.0/30")
 		assertIPs(t, "peer 0",
 			computeIPCandidates(ipNet, []string{"10.0.0.1", "10.0.0.2"}, "10.0.0.1", 1),
 			[]string{"10.0.0.2"})
+		assertIPs(t, "peer 1",
+			computeIPCandidates(ipNet, []string{"10.0.0.1", "10.0.0.2"}, "10.0.0.2", 1),
+			[]string{"10.0.0.1"})
+	})
 
-		got := computeIPCandidates(ipNet, []string{"10.0.0.1", "10.0.0.2"}, "10.0.0.2", 1)
-		if len(got) != 1 || got[0].String() != "10.0.0.1" {
-			t.Errorf("peer 1 on /30: got %v, want [10.0.0.1]", ipsToStrings(got))
+	t.Run("/30 minimal subnet, 3 peers — third has no room", func(t *testing.T) {
+		// peer 2: startOffset=1+2*1=3, broadcast(.3)-3=.0=network addr → no candidates
+		ipNet := mustParseCIDR(t, "10.0.0.0/30")
+		got := computeIPCandidates(ipNet, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, "10.0.0.3", 1)
+		if len(got) != 0 {
+			t.Errorf("peer 2 on /30: got %v, want empty", ipsToStrings(got))
 		}
 	})
 
