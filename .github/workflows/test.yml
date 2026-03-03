@@ -20,5 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: go get .
+      - name: Check go fix
+        run: go fix ./... && git diff --exit-code
       - name: Test
         run: go test -v ./...
