@@ -536,18 +536,17 @@ func (m *manager) connectNetworkHighIP(networkName string, containerID string, c
 			m.l.WithField("name", containerName).Infof("Assigned IP %s on network %s", ip, networkName)
 			return
 		}
-		m.l.WithField("name", containerName).Debugf("IP %s taken on network %s, trying next", ip, networkName)
+		m.l.WithField("name", containerName).Debugf("IP %s unavailable on network %s, trying next", ip, networkName)
 	}
 
-	m.l.WithField("name", containerName).Warnf("all candidate IPs taken on network %s, letting Docker assign", networkName)
-	err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
-	if err != nil {
-		m.l.WithField("name", containerName).WithError(err).Errorf("failed to connect network %s", networkName)
-	}
+	// Never fall back to Docker-assigned: a low IP would collide with Swarm's bottom-up allocation
+	m.l.WithField("name", containerName).Warnf("all %d candidate IPs exhausted on network %s, skipping", len(candidates), networkName)
 }
 
 // highIPCandidates returns IPs from a tight band at the top of the network's
 // subnet, using the overlay Peers list for deterministic per-node positioning.
+// Returns nil for non-overlay networks (caller should let Docker assign).
+// Returns a non-nil (possibly empty) slice for overlay networks.
 func (m *manager) highIPCandidates(networkName string, overlayIndex int) []net.IP {
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
@@ -580,14 +579,38 @@ func (m *manager) highIPCandidates(networkName string, overlayIndex int) []net.I
 		peerIPs[i] = p.IP
 	}
 
-	candidates := computeIPCandidates(ipNet, peerIPs, m.nodeAddr, m.overlayContainers)
-	if overlayIndex >= len(candidates) {
-		return nil
+	// Build set of IPs already used on this network (avoids 20s timeout for known conflicts)
+	usedIPs := make(map[string]bool)
+	for _, container := range networkInfo.Containers {
+		if container.IPv4Address != "" {
+			ip, _, parseErr := net.ParseCIDR(container.IPv4Address)
+			if parseErr == nil {
+				usedIPs[ip.String()] = true
+			}
+		}
 	}
-	return []net.IP{candidates[overlayIndex]}
+
+	candidates := computeIPCandidatesMultiRound(ipNet, peerIPs, m.nodeAddr, m.overlayContainers, 3)
+
+	// Pick this container's lane (every overlayContainers-th IP), skipping locally-visible conflicts
+	selected := []net.IP{}
+	for i := overlayIndex; i < len(candidates); i += m.overlayContainers {
+		if usedIPs[candidates[i].String()] {
+			m.l.WithField("network", networkName).Debugf("skipping %s (already used on this node)", candidates[i])
+			continue
+		}
+		selected = append(selected, candidates[i])
+	}
+	return selected
 }
 
 func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int) []net.IP {
+	return computeIPCandidatesMultiRound(ipNet, peerIPs, nodeAddr, overlayContainers, 1)
+}
+
+// computeIPCandidatesMultiRound generates candidate IPs across multiple rounds.
+// Each round provides overlayContainers IPs for this node, spaced below all peers' bands.
+func computeIPCandidatesMultiRound(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int, maxRounds int) []net.IP {
 	peerIPs = slices.Clone(peerIPs)
 	slices.SortFunc(peerIPs, func(a, b string) int {
 		return bytes.Compare(net.ParseIP(a).To4(), net.ParseIP(b).To4())
@@ -601,15 +624,18 @@ func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, ov
 		}
 	}
 
+	numPeers := len(peerIPs)
 	broadcast := broadcastAddr(ipNet)
-	startOffset := 1 + peerIndex*overlayContainers
 	var candidates []net.IP
-	for i := range overlayContainers {
-		ip := addToIP(broadcast, -(startOffset + i))
-		if !ipNet.Contains(ip) || ip.Equal(ipNet.IP) {
-			break
+	for round := range maxRounds {
+		startOffset := 1 + (round*numPeers+peerIndex)*overlayContainers
+		for i := range overlayContainers {
+			ip := addToIP(broadcast, -(startOffset + i))
+			if !ipNet.Contains(ip) || ip.Equal(ipNet.IP) {
+				return candidates
+			}
+			candidates = append(candidates, ip)
 		}
-		candidates = append(candidates, ip)
 	}
 
 	return candidates

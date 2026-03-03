@@ -537,6 +537,136 @@ func candidateForOverlayIndex(ipNet *net.IPNet, peerIPs []string, nodeAddr strin
 	return candidates[overlayIndex]
 }
 
+// candidatesForOverlayIndex mirrors the multi-round lane selection in highIPCandidates.
+func candidatesForOverlayIndex(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int, overlayIndex int, maxRounds int) []net.IP {
+	candidates := computeIPCandidatesMultiRound(ipNet, peerIPs, nodeAddr, overlayContainers, maxRounds)
+	var selected []net.IP
+	for i := overlayIndex; i < len(candidates); i += overlayContainers {
+		selected = append(selected, candidates[i])
+	}
+	return selected
+}
+
+func TestComputeIPCandidatesMultiRound(t *testing.T) {
+	t.Run("single round matches computeIPCandidates", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+
+		for _, peer := range peers {
+			single := computeIPCandidates(ipNet, peers, peer, 2)
+			multi := computeIPCandidatesMultiRound(ipNet, peers, peer, 2, 1)
+			assertIPs(t, "peer "+peer, multi, ipsToStrings(single))
+		}
+	})
+
+	t.Run("3 rounds, 4 peers, 2 containers: correct IPs per round", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+
+		// Peer 0 (10.0.0.1): round 0 offset 1,2; round 1 offset 9,10; round 2 offset 17,18
+		candidates := computeIPCandidatesMultiRound(ipNet, peers, "10.0.0.1", 2, 3)
+		assertIPs(t, "peer0 3 rounds", candidates, []string{
+			"10.0.71.254", "10.0.71.253", // round 0
+			"10.0.71.246", "10.0.71.245", // round 1
+			"10.0.71.238", "10.0.71.237", // round 2
+		})
+
+		// Peer 1 (10.0.0.2): round 0 offset 3,4; round 1 offset 11,12; round 2 offset 19,20
+		candidates = computeIPCandidatesMultiRound(ipNet, peers, "10.0.0.2", 2, 3)
+		assertIPs(t, "peer1 3 rounds", candidates, []string{
+			"10.0.71.252", "10.0.71.251", // round 0
+			"10.0.71.244", "10.0.71.243", // round 1
+			"10.0.71.236", "10.0.71.235", // round 2
+		})
+	})
+
+	t.Run("no overlap across peers and rounds", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := make([]string, 10)
+		for i := range peers {
+			peers[i] = fmt.Sprintf("10.0.0.%d", i+1)
+		}
+
+		seen := map[string]string{}
+		for _, peer := range peers {
+			candidates := computeIPCandidatesMultiRound(ipNet, peers, peer, 2, 5)
+			for _, ip := range candidates {
+				key := ip.String()
+				if prev, exists := seen[key]; exists {
+					t.Errorf("IP %s assigned to both %s and %s", key, prev, peer)
+				}
+				seen[key] = peer
+			}
+		}
+	})
+
+	t.Run("lane selection gives each container unique fallbacks", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+
+		lane0 := candidatesForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 0, 3)
+		lane1 := candidatesForOverlayIndex(ipNet, peers, "10.0.0.1", 2, 1, 3)
+
+		assertIPs(t, "container 0 lane", lane0, []string{"10.0.71.254", "10.0.71.246", "10.0.71.238"})
+		assertIPs(t, "container 1 lane", lane1, []string{"10.0.71.253", "10.0.71.245", "10.0.71.237"})
+
+		// No overlap between lanes
+		seen := map[string]bool{}
+		for _, ip := range lane0 {
+			seen[ip.String()] = true
+		}
+		for _, ip := range lane1 {
+			if seen[ip.String()] {
+				t.Errorf("lane overlap at %s", ip)
+			}
+		}
+	})
+
+	t.Run("subnet truncation: /24 with many peers limits rounds", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.1.0/24")
+		peers := make([]string, 48)
+		for i := range peers {
+			peers[i] = fmt.Sprintf("10.0.1.%d", i+1)
+		}
+
+		// First peer: round 0 works, round 1 needs offset 1+48*2=97 → .157, round 2 needs 1+96*2=193 → .62
+		candidates := computeIPCandidatesMultiRound(ipNet, peers, "10.0.1.1", 2, 5)
+		// Should have at least 2 rounds worth of IPs
+		if len(candidates) < 4 {
+			t.Errorf("expected at least 4 candidates, got %d: %v", len(candidates), ipsToStrings(candidates))
+		}
+
+		// Last peer (idx 47): round 0 needs offset 1+47*2=95 → .160,.159
+		// Round 1 needs offset 1+95*2=191 → broadcast-191 = .64,.63
+		// Round 2 would exceed subnet
+		lastCandidates := computeIPCandidatesMultiRound(ipNet, peers, "10.0.1.48", 2, 5)
+		if len(lastCandidates) < 2 {
+			t.Errorf("last peer expected at least 2 candidates, got %d", len(lastCandidates))
+		}
+	})
+
+	t.Run("lanes across peers never collide", func(t *testing.T) {
+		ipNet := mustParseCIDR(t, "10.0.64.0/21")
+		peers := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}
+		overlayContainers := 2
+
+		seen := map[string]string{}
+		for _, peer := range peers {
+			for idx := range overlayContainers {
+				lane := candidatesForOverlayIndex(ipNet, peers, peer, overlayContainers, idx, 3)
+				for _, ip := range lane {
+					key := ip.String()
+					label := fmt.Sprintf("%s[%d]", peer, idx)
+					if prev, exists := seen[key]; exists {
+						t.Errorf("IP %s assigned to %s and %s", key, prev, label)
+					}
+					seen[key] = label
+				}
+			}
+		}
+	})
+}
+
 func TestOverlayIndexSelection(t *testing.T) {
 	t.Run("two containers on same node get different IPs", func(t *testing.T) {
 		ipNet := mustParseCIDR(t, "10.0.64.0/21")
