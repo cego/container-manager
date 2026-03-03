@@ -220,6 +220,7 @@ func (m *manager) run(config *Config) {
 	}
 	m.l.WithField("networks", networkNames).Debugf("Networks: %s", networkNames)
 
+	overlayIndex := 0
 	for _, c := range config.Containers {
 
 		var networks []string = nil
@@ -229,14 +230,19 @@ func (m *manager) run(config *Config) {
 		}
 		networks = lo.Ternary(len(networks) > 0, networks, []string{"bridge"})
 
-		err = m.ensureContainer(c, networks)
+		currentIndex := overlayIndex
+		if c.AttachAllNetwork {
+			overlayIndex++
+		}
+
+		err = m.ensureContainer(c, networks, currentIndex)
 		if err != nil {
 			m.l.WithField("name", c.Name).WithError(err).Errorf("failed to enure container %s", c.Name)
 		}
 	}
 }
 
-func (m *manager) ensureContainer(config Container, networks []string) error {
+func (m *manager) ensureContainer(config Container, networks []string, overlayIndex int) error {
 	containers, err := m.cli.ContainerList(m.ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("name", fmt.Sprintf("^/%s$", config.Name)))})
 	if err != nil {
 		return err
@@ -282,7 +288,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 					return e.Name == config.Name
 				})
 				if !alreadyAttached {
-					m.connectNetworkHighIP(n, config.Name, config.Name)
+					m.connectNetworkHighIP(n, config.Name, config.Name, overlayIndex)
 				}
 			}
 
@@ -409,7 +415,7 @@ func (m *manager) ensureContainer(config Container, networks []string) error {
 		// Connect networks after start so overlay handshakes happen immediately
 		// and NetworkConnect returns the real error on IP conflict
 		for _, n := range networks {
-			m.connectNetworkHighIP(n, c.ID, config.Name)
+			m.connectNetworkHighIP(n, c.ID, config.Name, overlayIndex)
 		}
 
 		return nil
@@ -509,8 +515,8 @@ func (m *manager) detachNetwork(network string, container string) {
 // connectNetworkHighIP connects a container to a network using an IP from the
 // upper end of the subnet. If the chosen IP conflicts, it falls back to
 // Docker-assigned.
-func (m *manager) connectNetworkHighIP(networkName string, containerID string, containerName string) {
-	candidates := m.highIPCandidates(networkName)
+func (m *manager) connectNetworkHighIP(networkName string, containerID string, containerName string, overlayIndex int) {
+	candidates := m.highIPCandidates(networkName, overlayIndex)
 	if candidates == nil {
 		err := m.cli.NetworkConnect(m.ctx, networkName, containerID, nil)
 		if err != nil {
@@ -542,7 +548,7 @@ func (m *manager) connectNetworkHighIP(networkName string, containerID string, c
 
 // highIPCandidates returns IPs from a tight band at the top of the network's
 // subnet, using the overlay Peers list for deterministic per-node positioning.
-func (m *manager) highIPCandidates(networkName string) []net.IP {
+func (m *manager) highIPCandidates(networkName string, overlayIndex int) []net.IP {
 	networkInfo, err := m.cli.NetworkInspect(m.ctx, networkName, types.NetworkInspectOptions{})
 	if err != nil {
 		return nil
@@ -574,7 +580,11 @@ func (m *manager) highIPCandidates(networkName string) []net.IP {
 		peerIPs[i] = p.IP
 	}
 
-	return computeIPCandidates(ipNet, peerIPs, m.nodeAddr, m.overlayContainers)
+	candidates := computeIPCandidates(ipNet, peerIPs, m.nodeAddr, m.overlayContainers)
+	if overlayIndex >= len(candidates) {
+		return nil
+	}
+	return []net.IP{candidates[overlayIndex]}
 }
 
 func computeIPCandidates(ipNet *net.IPNet, peerIPs []string, nodeAddr string, overlayContainers int) []net.IP {
