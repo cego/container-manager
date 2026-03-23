@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/docker/cli v29.2.1+incompatible
 	github.com/docker/docker v25.0.14+incompatible
-	github.com/samber/lo v1.52.0
+	github.com/samber/lo v1.53.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.10.2
 	go.elastic.co/ecslogrus v1.0.0
