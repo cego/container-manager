@@ -3,7 +3,7 @@ module container-manager
 go 1.25.0
 
 require (
-	github.com/docker/cli v29.2.1+incompatible
+	github.com/docker/cli v29.5.0+incompatible
 	github.com/docker/docker v25.0.14+incompatible
 	github.com/samber/lo v1.52.0
 	github.com/sirupsen/logrus v1.9.4
